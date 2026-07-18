@@ -195,6 +195,7 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
 
         # Per-response gesture state (reset on response.created)
         self._gesture_buffer = ""
+        self._gesture_processed_len = 0
         self._gesture_fired: dict[str, bool] = {}
         self._gesture_last_t = 0.0
         
@@ -400,6 +401,7 @@ OpenClaw has access to many capabilities you don't have directly.""",
             self._speaking = True
             # Reset per-response gesture state
             self._gesture_buffer = ""
+            self._gesture_processed_len = 0
             self._gesture_fired = {}
             self._gesture_last_t = 0.0
             logger.debug("Response started")
@@ -652,13 +654,16 @@ OpenClaw has access to many capabilities you don't have directly.""",
         if now - self._gesture_last_t < 0.9:
             return
 
-        tail = self._gesture_buffer[-48:]
+        # Search only text not yet consumed by a fired gesture, so the same
+        # cue can't re-trigger once the cooldown expires
+        tail = self._gesture_buffer[self._gesture_processed_len:][-48:]
 
         # 1) Shy / hide face
         if not self._gesture_fired.get("shy"):
             if _find_cue(tail, ["害羞", "不好意思", "別看", "不要看", "shy", "embarrassed"]):
                 self._gesture_fired["shy"] = True
                 self._gesture_last_t = now
+                self._gesture_processed_len = len(self._gesture_buffer)
                 await self._queue_headlook_sequence(["down", "front"], [0.8, 1.0])
                 return
 
@@ -667,6 +672,7 @@ OpenClaw has access to many capabilities you don't have directly.""",
             if _find_cue(tail, ["不是", "不對", "不行", "沒有", "不要", "不可以", "no", "not", "nope", "never", "cannot"]):
                 self._gesture_fired["neg"] = True
                 self._gesture_last_t = now
+                self._gesture_processed_len = len(self._gesture_buffer)
                 await self._queue_headlook_sequence(
                     ["left", "right", "left", "right", "left", "front"],
                     [0.22, 0.22, 0.22, 0.22, 0.22, 0.35],
@@ -678,6 +684,7 @@ OpenClaw has access to many capabilities you don't have directly.""",
             if _find_cue(tail, ["沒錯", "對", "可以", "好", "同意", "yes", "yeah", "yep", "sure", "exactly", "of course"]):
                 self._gesture_fired["pos"] = True
                 self._gesture_last_t = now
+                self._gesture_processed_len = len(self._gesture_buffer)
                 await self._queue_headlook_sequence(
                     ["down", "up", "down", "up", "front"],
                     [0.22, 0.22, 0.22, 0.22, 0.40],
@@ -689,6 +696,7 @@ OpenClaw has access to many capabilities you don't have directly.""",
         hit = _find_cue(tail, ["搖頭", "shake my head", "點頭", "nod", "彈跳", "跳起來", "bounce", "搖擺", "搖晃", "左右搖", "擺動", "sway"])
         if hit:
             self._gesture_last_t = now
+            self._gesture_processed_len = len(self._gesture_buffer)
             if hit in ("搖頭", "shake my head"):
                 await self._queue_headlook_sequence(
                     ["left", "right", "left", "right", "left", "front"],
@@ -718,6 +726,7 @@ OpenClaw has access to many capabilities you don't have directly.""",
             if "?" in tail or "？" in tail or tail.rstrip().endswith(("嗎", "呢")):
                 self._gesture_fired["q"] = True
                 self._gesture_last_t = now
+                self._gesture_processed_len = len(self._gesture_buffer)
                 await self._queue_headlook_sequence(
                     ["right", "left", "right", "front"],
                     [0.22, 0.22, 0.22, 0.45],
@@ -725,24 +734,36 @@ OpenClaw has access to many capabilities you don't have directly.""",
                 return
 
     async def _queue_headlook_sequence(self, directions: list[str], durations: list[float]) -> None:
-        """Queue a short sequence of HeadLookMove moves."""
+        """Queue a short sequence of HeadLookMove moves.
+
+        Each move's start pose is chained to the previous move's target so
+        back-to-back queued moves stay continuous instead of snapping back
+        to the pose the robot had at queue time.
+        """
         from reachy_mini_openclaw.moves import HeadLookMove
 
         if not getattr(self.deps, "robot", None):
             return
 
+        prev_move = None
         for i, direction in enumerate(directions):
             duration = durations[i] if i < len(durations) else durations[-1]
             try:
-                _, current_ant = self.deps.robot.get_current_joint_positions()
-                current_head = self.deps.robot.get_current_head_pose()
+                if prev_move is None:
+                    _, current_ant = self.deps.robot.get_current_joint_positions()
+                    start_pose = self.deps.robot.get_current_head_pose()
+                    start_antennas = tuple(current_ant)
+                else:
+                    start_pose = prev_move.target_pose
+                    start_antennas = tuple(prev_move.target_antennas)
                 move = HeadLookMove(
                     direction=direction,
-                    start_pose=current_head,
-                    start_antennas=tuple(current_ant),
+                    start_pose=start_pose,
+                    start_antennas=start_antennas,
                     duration=float(duration),
                 )
                 self.deps.movement_manager.queue_move(move)
+                prev_move = move
             except Exception:
                 # If pose read fails, skip gracefully
                 return

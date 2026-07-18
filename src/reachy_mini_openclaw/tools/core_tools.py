@@ -26,6 +26,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Active body_sway background task; tracked so a new sway or stop_moves can
+# cancel it instead of letting concurrent runners fight over body_yaw
+_active_body_sway_task: Optional["asyncio.Task"] = None
+
+
+async def _cancel_active_body_sway() -> None:
+    """Cancel the running body_sway task, if any, and wait for it to finish."""
+    global _active_body_sway_task
+    task = _active_body_sway_task
+    _active_body_sway_task = None
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
 
 async def _analyze_image_with_openai(frame: np.ndarray, prompt: str) -> Optional[str]:
     """Analyze an image using OpenAI's Chat Completions API (gpt-4o-mini).
@@ -509,17 +526,27 @@ async def _handle_emotion(args: dict, deps: ToolDependencies) -> dict:
     sequence = emotion_sequences.get(emotion_name, ["front"])
 
     try:
+        # Chain each move's start pose to the previous move's target so the
+        # queued sequence stays continuous instead of snapping back to the
+        # pose the robot had at queue time
+        prev_move = None
         for direction in sequence:
-            _, current_ant = deps.robot.get_current_joint_positions()
-            current_head = deps.robot.get_current_head_pose()
+            if prev_move is None:
+                _, current_ant = deps.robot.get_current_joint_positions()
+                start_pose = deps.robot.get_current_head_pose()
+                start_antennas = tuple(current_ant)
+            else:
+                start_pose = prev_move.target_pose
+                start_antennas = tuple(prev_move.target_antennas)
 
             move = HeadLookMove(
                 direction=direction,
-                start_pose=current_head,
-                start_antennas=tuple(current_ant),
+                start_pose=start_pose,
+                start_antennas=start_antennas,
                 duration=0.32,
             )
             deps.movement_manager.queue_move(move)
+            prev_move = move
 
         return {
             "status": "success",
@@ -583,6 +610,10 @@ async def _handle_body_sway(args: dict, deps: ToolDependencies) -> dict:
     if robot is None or not hasattr(robot, "goto_target"):
         return {"error": "body_sway not available (robot.goto_target not found)"}
 
+    global _active_body_sway_task
+    # Only one sway at a time; concurrent runners would fight over body_yaw
+    await _cancel_active_body_sway()
+
     async def _runner():
         try:
             amp = float(np.deg2rad(amp_deg))
@@ -593,10 +624,17 @@ async def _handle_body_sway(args: dict, deps: ToolDependencies) -> dict:
                 await asyncio.sleep(duration)
 
             robot.goto_target(body_yaw=0.0, duration=duration, method="minjerk")
+        except asyncio.CancelledError:
+            # Recenter on cancellation so the body isn't left cocked sideways
+            try:
+                robot.goto_target(body_yaw=0.0, duration=duration, method="minjerk")
+            except Exception:
+                pass
+            raise
         except Exception as e:
             logger.warning("body_sway failed: %s", e)
 
-    asyncio.create_task(_runner())
+    _active_body_sway_task = asyncio.create_task(_runner())
     return {"status": "success", "amplitude_deg": amp_deg, "repeats": repeats}
 
 
@@ -625,6 +663,7 @@ async def _handle_shutdown(args: dict, deps: ToolDependencies) -> dict:
 
 async def _handle_stop_moves(args: dict, deps: ToolDependencies) -> dict:
     """Stop all movements."""
+    await _cancel_active_body_sway()
     deps.movement_manager.clear_move_queue()
     return {"status": "success", "message": "All movements stopped"}
 

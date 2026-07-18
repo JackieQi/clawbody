@@ -130,9 +130,22 @@ def _http_get_json(url: str):
         return None
 
 
+def _quote_dataset(dataset_name: str) -> str:
+    """Percent-encode a dataset name for a URL path.
+
+    Slashes stay literal: the daemon routes dataset names as multi-segment
+    paths (org/name), and encoding them as %2F would break route matching.
+    """
+    from urllib.parse import quote
+
+    return quote(dataset_name, safe="/")
+
+
 def list_recorded_emotions(dataset_name: str = DEFAULT_RECORDED_EMOTIONS_DATASET) -> list[str]:
     """List recorded emotion names from the Reachy Mini daemon (if available)."""
-    data = _http_get_json(f"{DAEMON_BASE_URL}/api/move/recorded-move-datasets/list/{dataset_name}")
+    data = _http_get_json(
+        f"{DAEMON_BASE_URL}/api/move/recorded-move-datasets/list/{_quote_dataset(dataset_name)}"
+    )
     if isinstance(data, list):
         return sorted([str(x) for x in data])
     return []
@@ -140,19 +153,27 @@ def list_recorded_emotions(dataset_name: str = DEFAULT_RECORDED_EMOTIONS_DATASET
 
 def list_recorded_dances(dataset_name: str = DEFAULT_RECORDED_DANCES_DATASET) -> list[str]:
     """List recorded dances from the Reachy Mini daemon (if available)."""
-    data = _http_get_json(f"{DAEMON_BASE_URL}/api/move/recorded-move-datasets/list/{dataset_name}")
+    data = _http_get_json(
+        f"{DAEMON_BASE_URL}/api/move/recorded-move-datasets/list/{_quote_dataset(dataset_name)}"
+    )
     if isinstance(data, list):
         return sorted([str(x) for x in data])
     return []
 
 
 def play_recorded_move(dataset_name: str, move_name: str) -> bool:
-    """Ask the Reachy Mini daemon to play a recorded move."""
+    """Ask the Reachy Mini daemon to play a recorded move.
+
+    move_name is fully percent-encoded: it often comes straight from the
+    LLM, and unencoded spaces or non-ASCII would make urllib reject the URL.
+    """
     try:
         import urllib.request
+        from urllib.parse import quote
 
         req = urllib.request.Request(
-            f"{DAEMON_BASE_URL}/api/move/play/recorded-move-dataset/{dataset_name}/{move_name}",
+            f"{DAEMON_BASE_URL}/api/move/play/recorded-move-dataset/"
+            f"{_quote_dataset(dataset_name)}/{quote(move_name, safe='')}",
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=2.0) as r:
