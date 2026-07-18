@@ -654,9 +654,11 @@ OpenClaw has access to many capabilities you don't have directly.""",
         if now - self._gesture_last_t < 0.9:
             return
 
-        # Search only text not yet consumed by a fired gesture, so the same
-        # cue can't re-trigger once the cooldown expires
-        tail = self._gesture_buffer[self._gesture_processed_len:][-48:]
+        # Search all text not yet consumed by a fired gesture: consumption
+        # stops the same cue re-triggering after the cooldown, and scanning
+        # the whole unconsumed region (it's small) means cues that streamed
+        # in during a cooldown aren't lost to a fixed-size window
+        tail = self._gesture_buffer[self._gesture_processed_len:]
 
         # 1) Shy / hide face
         if not self._gesture_fired.get("shy"):

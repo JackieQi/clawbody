@@ -615,19 +615,32 @@ async def _handle_body_sway(args: dict, deps: ToolDependencies) -> dict:
     await _cancel_active_body_sway()
 
     async def _runner():
+        # goto_target blocks its calling thread until the move completes
+        # (threading.Event wait in the SDK ws client), so every call runs in
+        # a worker thread; the blocking also provides the pacing, so no
+        # extra sleeps are needed between half-sways.
         try:
             amp = float(np.deg2rad(amp_deg))
             for _ in range(repeats):
-                robot.goto_target(body_yaw=+amp, duration=duration, method="minjerk")
-                await asyncio.sleep(duration)
-                robot.goto_target(body_yaw=-amp, duration=duration, method="minjerk")
-                await asyncio.sleep(duration)
+                await asyncio.to_thread(
+                    robot.goto_target, body_yaw=+amp, duration=duration, method="minjerk"
+                )
+                await asyncio.to_thread(
+                    robot.goto_target, body_yaw=-amp, duration=duration, method="minjerk"
+                )
 
-            robot.goto_target(body_yaw=0.0, duration=duration, method="minjerk")
+            await asyncio.to_thread(
+                robot.goto_target, body_yaw=0.0, duration=duration, method="minjerk"
+            )
         except asyncio.CancelledError:
             # Recenter on cancellation so the body isn't left cocked sideways
             try:
-                robot.goto_target(body_yaw=0.0, duration=duration, method="minjerk")
+                await asyncio.to_thread(
+                    robot.goto_target,
+                    body_yaw=0.0,
+                    duration=min(duration, 0.5),
+                    method="minjerk",
+                )
             except Exception:
                 pass
             raise
