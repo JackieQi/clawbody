@@ -45,6 +45,12 @@ OPENAI_SAMPLE_RATE: Final[Literal[24000]] = 24000
 # - "off": no automatic gestures
 GESTURE_MODE = os.getenv("CLAWBODY_GESTURE_MODE", "natural").strip().lower()
 
+# Echo defense: while robot audio is playing, mic frames quieter than this
+# RMS (float scale, 0..1) are dropped so the robot doesn't hear its own
+# speaker and spawn phantom turns. Louder speech still passes, so the user
+# can barge in. 0 disables the gate entirely.
+BARGE_IN_RMS = float(os.getenv("CLAWBODY_BARGE_IN_RMS", "0.06") or 0.0)
+
 # Base instructions for the robot body capabilities
 ROBOT_BODY_INSTRUCTIONS = """
 ## Your Robot Body (Reachy Mini)
@@ -205,6 +211,12 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         self._gesture_processed_len = 0
         self._gesture_fired: dict[str, bool] = {}
         self._gesture_last_t = 0.0
+
+        # Interruption/echo handling state
+        self._turn_counter = 0  # increments on each user speech start
+        self._current_item_id: Optional[str] = None  # assistant item being spoken
+        self._audio_play_start: Optional[float] = None  # wall time first audio of response
+        self._audio_enqueued_s = 0.0  # seconds of audio enqueued for current response
         
         # Lifecycle flags
         self._shutdown_requested = False
@@ -320,11 +332,15 @@ OpenClaw has access to many capabilities you don't have directly.""",
                             "transcription": {
                                 "model": "gpt-4o-transcribe",
                             },
+                            # Robot mic sits away from the speaker's mouth
+                            "noise_reduction": {"type": "far_field"},
                             "turn_detection": {
                                 "type": "server_vad",
-                                "threshold": 0.5,
+                                "threshold": 0.6,
                                 "prefix_padding_ms": 300,
                                 "silence_duration_ms": 600,
+                                "create_response": True,
+                                "interrupt_response": True,
                             },
                         },
                         "output": {
@@ -376,14 +392,39 @@ OpenClaw has access to many capabilities you don't have directly.""",
         
         # Speech detection
         if event_type == "input_audio_buffer.speech_started":
-            # User started speaking - stop any current output
+            # User started speaking - the new turn takes priority
+            self._turn_counter += 1
+            was_speaking = self._speaking
             self._speaking = False
             self.deps.movement_manager.set_processing(False)
+
+            # Tell the server where playback actually stopped, so its
+            # conversation history matches what the user heard instead of
+            # the full generated response
+            if was_speaking and self._current_item_id and self._audio_play_start is not None:
+                now = asyncio.get_event_loop().time()
+                played_ms = int(
+                    max(0.0, min(now - self._audio_play_start, self._audio_enqueued_s)) * 1000
+                )
+                try:
+                    await self.connection.conversation.item.truncate(
+                        item_id=self._current_item_id,
+                        content_index=0,
+                        audio_end_ms=played_ms,
+                    )
+                except Exception as e:
+                    logger.debug("Truncate failed: %s", e)
+                # Collapse the playback estimate: the local queue is flushed
+                # below, so only the short device tail remains
+                self._audio_enqueued_s = max(0.0, now - self._audio_play_start)
+
+            # Flush un-played audio and stale gestures from the old turn
             while not self.output_queue.empty():
                 try:
                     self.output_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+            self.deps.movement_manager.clear_move_queue()
             if self.deps.head_wobbler is not None:
                 self.deps.head_wobbler.reset()
             self.deps.movement_manager.set_listening(True)
@@ -411,6 +452,10 @@ OpenClaw has access to many capabilities you don't have directly.""",
             self._gesture_processed_len = 0
             self._gesture_fired = {}
             self._gesture_last_t = 0.0
+            # Reset playback tracking for the new response
+            self._current_item_id = None
+            self._audio_play_start = None
+            self._audio_enqueued_s = 0.0
             logger.debug("Response started")
             if GESTURE_MODE in ("natural", "turn"):
                 try:
@@ -431,10 +476,18 @@ OpenClaw has access to many capabilities you don't have directly.""",
             
             # Queue audio for playback
             audio_data = np.frombuffer(
-                base64.b64decode(event.delta), 
+                base64.b64decode(event.delta),
                 dtype=np.int16
             ).reshape(1, -1)
             await self.output_queue.put((OPENAI_SAMPLE_RATE, audio_data))
+
+            # Track playback progress for truncation and the echo gate
+            item_id = getattr(event, "item_id", None)
+            if isinstance(item_id, str):
+                self._current_item_id = item_id
+            if self._audio_play_start is None:
+                self._audio_play_start = asyncio.get_event_loop().time()
+            self._audio_enqueued_s += audio_data.shape[-1] / OPENAI_SAMPLE_RATE
             
         # Response text (for logging, UI, and live gesture triggers)
         if event_type == "response.output_audio_transcript.delta":
@@ -487,11 +540,12 @@ OpenClaw has access to many capabilities you don't have directly.""",
             return
             
         logger.info("Tool call: %s(%s)", tool_name, args_json[:50] if len(args_json) > 50 else args_json)
-        
+
         # Start thinking animation while we process the tool call.
         # It will stop when the next audio delta arrives or response completes.
         self.deps.movement_manager.set_processing(True)
-        
+        turn_at_start = self._turn_counter
+
         try:
             if tool_name == "ask_openclaw":
                 result = await self._handle_openclaw_query(args_json)
@@ -517,8 +571,17 @@ OpenClaw has access to many capabilities you don't have directly.""",
                     "output": json.dumps(result),
                 }
             )
-            # Trigger response generation after tool result
-            await self.connection.response.create()
+            # Trigger response generation after tool result — unless the user
+            # started a new turn while the tool ran, in which case forcing a
+            # response now would answer the stale question over the new one.
+            # The result stays in history for the next turn to use.
+            if self._turn_counter == turn_at_start:
+                await self.connection.response.create()
+            else:
+                logger.info(
+                    "Skipping response for stale tool '%s' result (user started a new turn)",
+                    tool_name,
+                )
             
     async def _sync_to_openclaw(self) -> None:
         """Sync the last conversation turn to OpenClaw for memory continuity."""
@@ -777,27 +840,46 @@ OpenClaw has access to many capabilities you don't have directly.""",
                 # If pose read fails, skip gracefully
                 return
 
+    def _robot_audio_playing(self) -> bool:
+        """Best-effort: is robot speech currently audible from the speaker?"""
+        if self._speaking:
+            return True
+        if self._audio_play_start is None:
+            return False
+        now = asyncio.get_event_loop().time()
+        # 0.6s grace covers the device-side pipeline tail
+        return now < self._audio_play_start + self._audio_enqueued_s + 0.6
+
     async def receive(self, frame: Tuple[int, NDArray]) -> None:
         """Receive audio from the robot microphone."""
         if not self.connection:
             return
-            
+
         input_sr, audio = frame
-        
+
         # Handle stereo
         if audio.ndim == 2:
             if audio.shape[1] > audio.shape[0]:
                 audio = audio.T
             if audio.shape[1] > 1:
                 audio = audio[:, 0]
-        
+
         audio = audio.flatten()
-        
+
         # Convert to float for resampling
         if audio.dtype == np.int16:
             audio = audio.astype(np.float32) / 32768.0
         elif audio.dtype != np.float32:
             audio = audio.astype(np.float32)
+
+        # Echo gate: while the robot's own speech is playing, drop quiet mic
+        # frames (mostly speaker bleed) so the server VAD doesn't spawn
+        # phantom user turns; loud speech still passes so the user can
+        # interrupt. BARGE_IN_RMS=0 disables the gate.
+        if BARGE_IN_RMS > 0.0 and self._robot_audio_playing():
+            rms = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
+            if rms < BARGE_IN_RMS:
+                return
                 
         # Resample to OpenAI sample rate
         if input_sr != OPENAI_SAMPLE_RATE:
