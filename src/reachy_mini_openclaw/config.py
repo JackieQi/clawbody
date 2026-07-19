@@ -18,45 +18,64 @@ load_dotenv(_project_root / ".env")
 @dataclass
 class Config:
     """Application configuration loaded from environment variables."""
-    
+
     # OpenAI Configuration
-    OPENAI_API_KEY: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
-    OPENAI_MODEL: str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-realtime-1.5"))
-    OPENAI_VOICE: str = field(default_factory=lambda: os.getenv("OPENAI_VOICE", "cedar"))
+    OPENAI_API_KEY: str = field(
+        default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
+    OPENAI_MODEL: str = field(default_factory=lambda: os.getenv(
+        "OPENAI_MODEL", "gpt-realtime-mini-2025-12-15"))
+    OPENAI_VOICE: str = field(
+        default_factory=lambda: os.getenv("OPENAI_VOICE", "cedar"))
     # Speech-to-text model for the Realtime session's input transcription
-    OPENAI_TRANSCRIPTION_MODEL: str = field(default_factory=lambda: os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-transcribe"))
+    OPENAI_TRANSCRIPTION_MODEL: str = field(default_factory=lambda: os.getenv(
+        "OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe-2025-12-15"))
     # Vision model for camera image analysis (cloud image-to-text fallback)
-    OPENAI_VISION_MODEL: str = field(default_factory=lambda: os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini"))
-    
+    OPENAI_VISION_MODEL: str = field(
+        default_factory=lambda: os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini"))
+
     # OpenClaw Gateway Configuration
-    OPENCLAW_GATEWAY_URL: str = field(default_factory=lambda: os.getenv("OPENCLAW_GATEWAY_URL", "ws://localhost:18789"))
-    OPENCLAW_TOKEN: Optional[str] = field(default_factory=lambda: os.getenv("OPENCLAW_TOKEN"))
-    OPENCLAW_AGENT_ID: str = field(default_factory=lambda: os.getenv("OPENCLAW_AGENT_ID", "main"))
+    OPENCLAW_GATEWAY_URL: str = field(default_factory=lambda: os.getenv(
+        "OPENCLAW_GATEWAY_URL", "ws://localhost:18789"))
+    OPENCLAW_TOKEN: Optional[str] = field(
+        default_factory=lambda: os.getenv("OPENCLAW_TOKEN"))
+    OPENCLAW_AGENT_ID: str = field(
+        default_factory=lambda: os.getenv("OPENCLAW_AGENT_ID", "main"))
     # Session key for OpenClaw - uses "main" to share context with WhatsApp and other channels
     # Format: agent:<agent_id>:<session_key>, but we only need the session key part here
-    OPENCLAW_SESSION_KEY: str = field(default_factory=lambda: os.getenv("OPENCLAW_SESSION_KEY", "main"))
-    
+    OPENCLAW_SESSION_KEY: str = field(
+        default_factory=lambda: os.getenv("OPENCLAW_SESSION_KEY", "main"))
+
     # Robot Configuration
-    ROBOT_NAME: Optional[str] = field(default_factory=lambda: os.getenv("ROBOT_NAME"))
-    
+    ROBOT_NAME: Optional[str] = field(
+        default_factory=lambda: os.getenv("ROBOT_NAME"))
+
     # Feature Flags
-    ENABLE_OPENCLAW_TOOLS: bool = field(default_factory=lambda: os.getenv("ENABLE_OPENCLAW_TOOLS", "true").lower() == "true")
-    ENABLE_CAMERA: bool = field(default_factory=lambda: os.getenv("ENABLE_CAMERA", "true").lower() == "true")
-    ENABLE_FACE_TRACKING: bool = field(default_factory=lambda: os.getenv("ENABLE_FACE_TRACKING", "true").lower() == "true")
-    
+    ENABLE_OPENCLAW_TOOLS: bool = field(default_factory=lambda: os.getenv(
+        "ENABLE_OPENCLAW_TOOLS", "true").lower() == "true")
+    ENABLE_CAMERA: bool = field(default_factory=lambda: os.getenv(
+        "ENABLE_CAMERA", "true").lower() == "true")
+    ENABLE_FACE_TRACKING: bool = field(default_factory=lambda: os.getenv(
+        "ENABLE_FACE_TRACKING", "true").lower() == "true")
+
     # Face Tracking Configuration
     # Options: "yolo", "mediapipe", or None for auto-detect
-    HEAD_TRACKER_TYPE: Optional[str] = field(default_factory=lambda: os.getenv("HEAD_TRACKER_TYPE", "yolo"))
-    
+    HEAD_TRACKER_TYPE: Optional[str] = field(
+        default_factory=lambda: os.getenv("HEAD_TRACKER_TYPE", "yolo"))
+
     # Local Vision Processing
-    ENABLE_LOCAL_VISION: bool = field(default_factory=lambda: os.getenv("ENABLE_LOCAL_VISION", "false").lower() == "true")
-    LOCAL_VISION_MODEL: str = field(default_factory=lambda: os.getenv("LOCAL_VISION_MODEL", "HuggingFaceTB/SmolVLM2-256M-Video-Instruct"))
-    VISION_DEVICE: str = field(default_factory=lambda: os.getenv("VISION_DEVICE", "auto"))  # "auto", "cuda", "mps", "cpu"
-    HF_HOME: str = field(default_factory=lambda: os.getenv("HF_HOME", os.path.expanduser("~/.cache/huggingface")))
-    
+    ENABLE_LOCAL_VISION: bool = field(default_factory=lambda: os.getenv(
+        "ENABLE_LOCAL_VISION", "false").lower() == "true")
+    LOCAL_VISION_MODEL: str = field(default_factory=lambda: os.getenv(
+        "LOCAL_VISION_MODEL", "HuggingFaceTB/SmolVLM2-256M-Video-Instruct"))
+    VISION_DEVICE: str = field(default_factory=lambda: os.getenv(
+        "VISION_DEVICE", "auto"))  # "auto", "cuda", "mps", "cpu"
+    HF_HOME: str = field(default_factory=lambda: os.getenv(
+        "HF_HOME", os.path.expanduser("~/.cache/huggingface")))
+
     # Custom Profile (for personality customization)
-    CUSTOM_PROFILE: Optional[str] = field(default_factory=lambda: os.getenv("REACHY_MINI_CUSTOM_PROFILE"))
-    
+    CUSTOM_PROFILE: Optional[str] = field(
+        default_factory=lambda: os.getenv("REACHY_MINI_CUSTOM_PROFILE"))
+
     def validate(self) -> list[str]:
         """Validate configuration and return list of errors."""
         errors = []
