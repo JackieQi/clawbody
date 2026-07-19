@@ -51,6 +51,15 @@ GESTURE_MODE = os.getenv("CLAWBODY_GESTURE_MODE", "natural").strip().lower()
 # can barge in. 0 disables the gate entirely.
 BARGE_IN_RMS = float(os.getenv("CLAWBODY_BARGE_IN_RMS", "0.06") or 0.0)
 
+# Sound-source orientation: when the user starts speaking, read Direction of
+# Arrival from the mic array and turn the head toward the voice.
+# The ReSpeaker reports 0=left, pi/2=front, pi=right across a 180° arc.
+DOA_MODE = os.getenv("CLAWBODY_DOA_MODE", "on").strip().lower()
+# Set to 1 if the robot turns away from you instead of toward you
+DOA_FLIP = os.getenv("CLAWBODY_DOA_FLIP", "0").strip() in ("1", "true", "yes")
+DOA_MAX_YAW_DEG = 35.0
+DOA_DEADBAND_DEG = 8.0
+
 # Base instructions for the robot body capabilities
 ROBOT_BODY_INSTRUCTIONS = """
 ## Your Robot Body (Reachy Mini)
@@ -217,6 +226,9 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         self._current_item_id: Optional[str] = None  # assistant item being spoken
         self._audio_play_start: Optional[float] = None  # wall time first audio of response
         self._audio_enqueued_s = 0.0  # seconds of audio enqueued for current response
+
+        # Strong refs to fire-and-forget tasks (event loop keeps only weak refs)
+        self._bg_tasks: set = set()
         
         # Lifecycle flags
         self._shutdown_requested = False
@@ -429,6 +441,12 @@ OpenClaw has access to many capabilities you don't have directly.""",
                 self.deps.head_wobbler.reset()
             self.deps.movement_manager.set_listening(True)
             logger.info("User started speaking")
+
+            # Turn the head toward the voice (Direction of Arrival)
+            if DOA_MODE == "on":
+                task = asyncio.create_task(self._turn_toward_voice())
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._bg_tasks.discard)
             
         if event_type == "input_audio_buffer.speech_stopped":
             self.deps.movement_manager.set_listening(False)
@@ -804,6 +822,50 @@ OpenClaw has access to many capabilities you don't have directly.""",
                     [0.22, 0.22, 0.22, 0.45],
                 )
                 return
+
+    async def _turn_toward_voice(self) -> None:
+        """Read Direction of Arrival and turn the head toward the speaker.
+
+        Runs as a fire-and-forget task on user speech start. The ReSpeaker
+        answers over a USB control read, so it runs in a worker thread to
+        keep the event loop free.
+        """
+        robot = getattr(self.deps, "robot", None)
+        media = getattr(robot, "media", None)
+        get_doa = getattr(media, "get_DoA", None)
+        if not callable(get_doa):
+            return
+
+        try:
+            doa = await asyncio.to_thread(get_doa)
+            if doa is None:
+                return
+            angle, _speech = doa
+
+            # 0=left, pi/2=front, pi=right -> positive yaw = left (robot frame)
+            yaw_deg = float(np.degrees(np.pi / 2 - float(angle)))
+            if DOA_FLIP:
+                yaw_deg = -yaw_deg
+            yaw_deg = max(-DOA_MAX_YAW_DEG, min(DOA_MAX_YAW_DEG, yaw_deg))
+
+            if abs(yaw_deg) < DOA_DEADBAND_DEG:
+                return  # already roughly facing the speaker
+
+            from reachy_mini_openclaw.moves import HeadLookMove
+
+            _, current_ant = robot.get_current_joint_positions()
+            current_head = robot.get_current_head_pose()
+            move = HeadLookMove(
+                direction="front",
+                start_pose=current_head,
+                start_antennas=tuple(current_ant),
+                duration=0.5,
+                target_yaw_deg=yaw_deg,
+            )
+            self.deps.movement_manager.queue_move(move)
+            logger.info("Turning toward voice: DoA %.2f rad -> yaw %+.0f°", angle, yaw_deg)
+        except Exception as e:
+            logger.debug("DoA turn failed: %s", e)
 
     async def _queue_headlook_sequence(self, directions: list[str], durations: list[float]) -> None:
         """Queue a short sequence of HeadLookMove moves.

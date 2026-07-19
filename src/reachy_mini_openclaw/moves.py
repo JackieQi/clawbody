@@ -127,27 +127,38 @@ class HeadLookMove(Move):
         start_pose: NDArray[np.float32],
         start_antennas: Tuple[float, float],
         duration: float = 1.0,
+        target_yaw_deg: Optional[float] = None,
     ):
         """Initialize head look move.
-        
+
         Args:
             direction: One of 'left', 'right', 'up', 'down', 'front'
             start_pose: Current head pose
             start_antennas: Current antenna positions
             duration: Move duration in seconds
+            target_yaw_deg: If set, look at this exact yaw (degrees, positive
+                = left) instead of the discrete direction target. Used for
+                sound-source (DoA) orientation.
         """
         self.direction = direction
         self.start_pose = start_pose
         self.start_antennas = np.array(start_antennas)
         self._duration = duration
-        
-        # Get target pose from direction
-        params = self.DIRECTIONS.get(direction, self.DIRECTIONS["front"])
-        self.target_pose = create_head_pose(
-            x=params[0], y=params[1], z=params[2],
-            roll=params[3], pitch=params[4], yaw=params[5],
-            degrees=True, mm=True
-        )
+        self.target_yaw_deg = target_yaw_deg
+
+        if target_yaw_deg is not None:
+            self.target_pose = create_head_pose(
+                x=0, y=0, z=0, roll=0, pitch=0, yaw=target_yaw_deg,
+                degrees=True, mm=True
+            )
+        else:
+            # Get target pose from direction
+            params = self.DIRECTIONS.get(direction, self.DIRECTIONS["front"])
+            self.target_pose = create_head_pose(
+                x=params[0], y=params[1], z=params[2],
+                roll=params[3], pitch=params[4], yaw=params[5],
+                degrees=True, mm=True
+            )
         self.target_antennas = np.array([0.0, 0.0])
         
     @property
