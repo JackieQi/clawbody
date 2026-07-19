@@ -130,12 +130,17 @@ def _find_cue(text: str, cues: list[str]) -> Optional[str]:
 
     CJK cues match as substrings; Latin cues match on word boundaries
     (case-insensitive) so short words like "hi" don't fire inside "this".
+    Boundaries are explicit ASCII-alnum lookarounds rather than \\b, which
+    counts CJK ideographs as word characters and would stop Latin cues
+    matching when adjacent to CJK text (e.g. "你好hi").
     """
     for cue in cues:
         if _CJK_RE.search(cue):
             if cue in text:
                 return cue
-        elif re.search(rf"\b{re.escape(cue)}\b", text, re.IGNORECASE):
+        elif re.search(
+            rf"(?<![a-zA-Z0-9]){re.escape(cue)}(?![a-zA-Z0-9])", text, re.IGNORECASE
+        ):
             return cue
     return None
 

@@ -244,10 +244,12 @@ class OpenClawBridge:
             raw = await asyncio.wait_for(self._ws.recv(), timeout=10)
             challenge = json.loads(raw)
             nonce = None
-            if challenge.get("event") != "connect.challenge":
-                logger.warning("Unexpected first frame: %s", challenge.get("event"))
+            if not isinstance(challenge, dict) or challenge.get("event") != "connect.challenge":
+                logger.warning("Unexpected first frame: %s", challenge)
             else:
-                payload = challenge.get("payload") or {}
+                payload = challenge.get("payload")
+                if not isinstance(payload, dict):
+                    payload = {}
                 nonce = payload.get("nonce") or challenge.get("nonce")
 
             # 2. Send connect request (with signed device identity when possible)
@@ -289,11 +291,17 @@ class OpenClawBridge:
             # 3. Read hello response
             raw = await asyncio.wait_for(self._ws.recv(), timeout=10)
             hello = json.loads(raw)
+            if not isinstance(hello, dict):
+                logger.error("Unexpected connect response: %s", hello)
+                await self._close_ws()
+                return False
 
             if hello.get("ok"):
                 self._connected = True
-                payload = hello.get("payload", {})
-                server = payload.get("server", {})
+                payload = hello.get("payload")
+                payload = payload if isinstance(payload, dict) else {}
+                server = payload.get("server")
+                server = server if isinstance(server, dict) else {}
                 self._conn_id = server.get("connId")
                 logger.info(
                     "Connected to OpenClaw gateway (server=%s, connId=%s)",
@@ -306,7 +314,8 @@ class OpenClawBridge:
                 )
                 return True
             else:
-                err = hello.get("error", {})
+                err = hello.get("error")
+                err = err if isinstance(err, dict) else {}
                 logger.error(
                     "OpenClaw connect failed: %s - %s",
                     err.get("code"),
