@@ -136,7 +136,9 @@ def _find_cue(text: str, cues: list[str]) -> Optional[str]:
     """
     for cue in cues:
         if _CJK_RE.search(cue):
-            if cue in text:
+            # re.search instead of `in` so any Latin chars inside a mixed
+            # CJK/Latin cue still match case-insensitively
+            if re.search(re.escape(cue), text, re.IGNORECASE):
                 return cue
         elif re.search(
             rf"(?<![a-zA-Z0-9]){re.escape(cue)}(?![a-zA-Z0-9])", text, re.IGNORECASE

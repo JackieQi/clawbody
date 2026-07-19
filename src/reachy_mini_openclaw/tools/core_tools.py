@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 # cancel it instead of letting concurrent runners fight over body_yaw
 _active_body_sway_task: Optional["asyncio.Task"] = None
 
+# Strong references to fire-and-forget tasks (e.g. delayed shutdown); the
+# event loop only keeps weak refs, so an unreferenced task can be GC'd
+# before it runs
+_background_tasks: set = set()
+
 
 async def _cancel_active_body_sway() -> None:
     """Cancel the running body_sway task, if any, and wait for it to finish."""
@@ -666,7 +671,9 @@ async def _handle_shutdown(args: dict, deps: ToolDependencies) -> dict:
         logger.warning("Graceful shutdown did not complete; forcing exit")
         os._exit(0)
 
-    asyncio.create_task(_do_shutdown())
+    task = asyncio.create_task(_do_shutdown())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return {
         "status": "success",
