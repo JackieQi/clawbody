@@ -23,6 +23,10 @@ class Config:
     OPENAI_API_KEY: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
     OPENAI_MODEL: str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-realtime-1.5"))
     OPENAI_VOICE: str = field(default_factory=lambda: os.getenv("OPENAI_VOICE", "cedar"))
+    # Speech-to-text model for the Realtime session's input transcription
+    OPENAI_TRANSCRIPTION_MODEL: str = field(default_factory=lambda: os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-transcribe"))
+    # Vision model for camera image analysis (cloud image-to-text fallback)
+    OPENAI_VISION_MODEL: str = field(default_factory=lambda: os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini"))
     
     # OpenClaw Gateway Configuration
     OPENCLAW_GATEWAY_URL: str = field(default_factory=lambda: os.getenv("OPENCLAW_GATEWAY_URL", "ws://localhost:18789"))

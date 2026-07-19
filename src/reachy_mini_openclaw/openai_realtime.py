@@ -343,7 +343,7 @@ OpenClaw has access to many capabilities you don't have directly.""",
                         "input": {
                             "format": {"type": "audio/pcm", "rate": OPENAI_SAMPLE_RATE},
                             "transcription": {
-                                "model": "gpt-4o-transcribe",
+                                "model": config.OPENAI_TRANSCRIPTION_MODEL,
                             },
                             # Robot mic sits away from the speaker's mouth
                             "noise_reduction": {"type": "far_field"},

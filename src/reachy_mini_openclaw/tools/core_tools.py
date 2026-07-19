@@ -50,10 +50,11 @@ async def _cancel_active_body_sway() -> None:
 
 
 async def _analyze_image_with_openai(frame: np.ndarray, prompt: str) -> Optional[str]:
-    """Analyze an image using OpenAI's Chat Completions API (gpt-4o-mini).
+    """Analyze an image using OpenAI's Chat Completions API.
 
-    This provides reliable cloud-based vision analysis using the same
-    OPENAI_API_KEY already configured for the Realtime API.
+    The model comes from config.OPENAI_VISION_MODEL. This provides reliable
+    cloud-based vision analysis using the same OPENAI_API_KEY already
+    configured for the Realtime API.
 
     Args:
         frame: BGR numpy array from the camera
@@ -78,7 +79,7 @@ async def _analyze_image_with_openai(frame: np.ndarray, prompt: str) -> Optional
 
         client = AsyncOpenAI(api_key=api_key)
         response = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=config.OPENAI_VISION_MODEL,
             max_tokens=300,
             messages=[
                 {
@@ -364,8 +365,8 @@ async def _handle_camera(args: dict, deps: ToolDependencies) -> dict:
     """Handle the camera tool - capture image and get description.
     
     Priority order for vision analysis:
-    1. Local SmolVLM2 (on-device, no network latency)
-    2. OpenAI Vision API (gpt-4o-mini, reliable cloud vision)
+    1. Local vision model (on-device, no network latency)
+    2. OpenAI Vision API (config.OPENAI_VISION_MODEL, reliable cloud vision)
     3. OpenClaw bridge (text-only fallback)
     """
     logger.info("Camera tool called, camera_worker=%s, vision_manager=%s", 
@@ -414,8 +415,9 @@ async def _handle_camera(args: dict, deps: ToolDependencies) -> dict:
             else:
                 logger.warning("Local vision failed: %s", description)
         
-        # Option 2: Use OpenAI Vision API (gpt-4o-mini) for image analysis
-        logger.info("Using OpenAI Vision API (gpt-4o-mini) for image analysis...")
+        # Option 2: Use OpenAI Vision API for image analysis
+        from reachy_mini_openclaw.config import config as _config
+        logger.info("Using OpenAI Vision API (%s) for image analysis...", _config.OPENAI_VISION_MODEL)
         openai_description = await _analyze_image_with_openai(frame, vision_prompt)
         if openai_description:
             logger.info("OpenAI vision response: %s", openai_description[:100])
