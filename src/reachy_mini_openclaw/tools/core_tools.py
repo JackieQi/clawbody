@@ -667,7 +667,9 @@ async def _handle_shutdown(args: dict, deps: ToolDependencies) -> dict:
         # SIGINT triggers the normal KeyboardInterrupt path in main(),
         # which runs app.stop() for a clean robot/bridge teardown.
         os.kill(os.getpid(), signal.SIGINT)
-        await asyncio.sleep(5.0)
+        # Media/GStreamer teardown on the robot can take a while; give the
+        # graceful path ample time before forcing the exit
+        await asyncio.sleep(15.0)
         logger.warning("Graceful shutdown did not complete; forcing exit")
         os._exit(0)
 

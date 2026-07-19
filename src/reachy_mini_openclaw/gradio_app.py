@@ -110,7 +110,7 @@ def launch_gradio(
             time.sleep(1.0)
             # SIGINT lets gradio shut its server down cleanly
             os.kill(os.getpid(), signal.SIGINT)
-            time.sleep(5.0)
+            time.sleep(15.0)
             os._exit(0)
 
         threading.Thread(target=do_exit, daemon=True).start()
