@@ -210,6 +210,21 @@ TOOL_SPECS = [
     },
     {
         "type": "function",
+        "name": "turn_body",
+        "description": "Rotate the robot's body/base by a relative angle. Use for 'turn around' (180), 'turn left a bit' (45), or a full spin (360). Positive degrees turn left (counterclockwise), negative turn right.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "degrees": {
+                    "type": "number",
+                    "description": "Relative turn in degrees; positive = left, negative = right. Range -360 to 360."
+                }
+            },
+            "required": ["degrees"]
+        }
+    },
+    {
+        "type": "function",
         "name": "body_sway",
         "description": "Sway the robot body/base left-right (body_yaw) then return to center. Useful for expressive emphasis.",
         "parameters": {
@@ -303,6 +318,7 @@ async def dispatch_tool_call(
         "dance": _handle_dance,
         "emotion": _handle_emotion,
         "capabilities": _handle_capabilities,
+        "turn_body": _handle_turn_body,
         "body_sway": _handle_body_sway,
         "stop_moves": _handle_stop_moves,
         "idle": _handle_idle,
@@ -597,10 +613,31 @@ async def _handle_capabilities(args: dict, deps: ToolDependencies) -> dict:
     }
 
 
+async def _handle_turn_body(args: dict, deps: ToolDependencies) -> dict:
+    """Rotate the base by a relative angle via the movement manager.
+
+    The manager's 100Hz loop owns set_target, so rotation must go through
+    its persistent body-yaw target rather than a competing goto_target.
+    """
+    mm = deps.movement_manager
+    if not hasattr(mm, "set_body_yaw"):
+        return {"error": "turn_body not available (movement manager too old)"}
+
+    degrees = float(args.get("degrees", 0) or 0)
+    degrees = max(-360.0, min(360.0, degrees))
+    if abs(degrees) < 1.0:
+        return {"status": "success", "message": "No meaningful turn requested"}
+
+    mm.set_body_yaw(float(np.deg2rad(degrees)), relative=True)
+    return {"status": "success", "turned_degrees": degrees, "message": "Turning now"}
+
+
 async def _handle_body_sway(args: dict, deps: ToolDependencies) -> dict:
     """Sway the robot base/body yaw left-right then return to center.
 
-    Uses Reachy Mini SDK goto_target(body_yaw=...) if available.
+    Oscillates the movement manager's persistent body-yaw target; the
+    manager's 100Hz loop owns set_target, so a competing goto_target would
+    be overridden.
     """
     amp_deg = float(args.get("amplitude_deg", 12) or 12)
     repeats = int(args.get("repeats", 1) or 1)
@@ -611,41 +648,29 @@ async def _handle_body_sway(args: dict, deps: ToolDependencies) -> dict:
     repeats = max(1, min(3, repeats))
     duration = max(0.25, min(2.0, duration))
 
-    robot = getattr(deps, "robot", None)
-    if robot is None or not hasattr(robot, "goto_target"):
-        return {"error": "body_sway not available (robot.goto_target not found)"}
+    mm = deps.movement_manager
+    if not hasattr(mm, "set_body_yaw"):
+        return {"error": "body_sway not available (movement manager too old)"}
 
     global _active_body_sway_task
-    # Only one sway at a time; concurrent runners would fight over body_yaw
+    # Only one sway at a time; concurrent runners would fight over the target
     await _cancel_active_body_sway()
 
-    async def _runner():
-        # goto_target blocks its calling thread until the move completes
-        # (threading.Event wait in the SDK ws client), so every call runs in
-        # a worker thread; the blocking also provides the pacing, so no
-        # extra sleeps are needed between half-sways.
-        try:
-            amp = float(np.deg2rad(amp_deg))
-            for _ in range(repeats):
-                await asyncio.to_thread(
-                    robot.goto_target, body_yaw=+amp, duration=duration, method="minjerk"
-                )
-                await asyncio.to_thread(
-                    robot.goto_target, body_yaw=-amp, duration=duration, method="minjerk"
-                )
+    center = float(mm.get_body_yaw()[1])  # sway around the current heading
+    amp = float(np.deg2rad(amp_deg))
 
-            await asyncio.to_thread(
-                robot.goto_target, body_yaw=0.0, duration=duration, method="minjerk"
-            )
+    async def _runner():
+        try:
+            for _ in range(repeats):
+                mm.set_body_yaw(center + amp)
+                await asyncio.sleep(duration)
+                mm.set_body_yaw(center - amp)
+                await asyncio.sleep(duration)
+            mm.set_body_yaw(center)
         except asyncio.CancelledError:
             # Recenter on cancellation so the body isn't left cocked sideways
             try:
-                await asyncio.to_thread(
-                    robot.goto_target,
-                    body_yaw=0.0,
-                    duration=min(duration, 0.5),
-                    method="minjerk",
-                )
+                mm.set_body_yaw(center)
             except Exception:
                 pass
             raise
@@ -687,6 +712,8 @@ async def _handle_stop_moves(args: dict, deps: ToolDependencies) -> dict:
     """Stop all movements."""
     await _cancel_active_body_sway()
     deps.movement_manager.clear_move_queue()
+    if hasattr(deps.movement_manager, "halt_body_yaw"):
+        deps.movement_manager.halt_body_yaw()
     return {"status": "success", "message": "All movements stopped"}
 
 

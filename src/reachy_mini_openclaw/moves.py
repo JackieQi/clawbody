@@ -294,11 +294,19 @@ class MovementManager:
         self._processing_start_time = 0.0
         self._thinking_amplitude = 0.0  # 0..1 envelope for smooth fade in/out
         self._thinking_antenna_offsets: Tuple[float, float] = (0.0, 0.0)
-        
+
+        # Persistent base body yaw (radians): slewed toward its target each
+        # tick and added to every command, so the base can rotate (up to a
+        # full 360°) while head moves/offsets compose on top
+        self._body_yaw_current = 0.0
+        self._body_yaw_target = 0.0
+        self.body_yaw_rate = float(np.deg2rad(120.0))  # max slew speed, rad/s
+
         # Shared state lock
         self._shared_lock = threading.Lock()
         self._shared_last_activity = self.state.last_activity_time
         self._shared_is_listening = False
+        self._shared_body_yaw = (0.0, 0.0)  # (current, target)
         
     def queue_move(self, move: Move) -> None:
         """Queue a primary move. Thread-safe."""
@@ -320,12 +328,29 @@ class MovementManager:
         
     def set_processing(self, processing: bool) -> None:
         """Set processing state (triggers thinking animation). Thread-safe.
-        
+
         When True, the robot shows a continuous 'thinking' animation as
         secondary offsets -- gentle head sway and asymmetric antenna scanning.
         Face tracking continues underneath since this is additive.
         """
         self._command_queue.put(("set_processing", processing))
+
+    def set_body_yaw(self, yaw_rad: float, relative: bool = False) -> None:
+        """Set the persistent base body yaw target in radians. Thread-safe.
+
+        The control loop slews toward the target at body_yaw_rate, so large
+        turns (including a full 360°) happen smoothly over multiple ticks.
+        """
+        self._command_queue.put(("set_body_yaw", (float(yaw_rad), bool(relative))))
+
+    def halt_body_yaw(self) -> None:
+        """Stop any body rotation in progress at its current angle. Thread-safe."""
+        self._command_queue.put(("halt_body_yaw", None))
+
+    def get_body_yaw(self) -> Tuple[float, float]:
+        """Get (current, target) base body yaw in radians. Thread-safe."""
+        with self._shared_lock:
+            return self._shared_body_yaw
         
     def is_idle(self) -> bool:
         """Check if robot has been idle. Thread-safe."""
@@ -444,6 +469,13 @@ class MovementManager:
                 # Amplitude will decay smoothly in _update_thinking_offsets
                 self.state.update_activity()
                 logger.debug("Processing ended - thinking animation decaying")
+        elif cmd == "set_body_yaw":
+            yaw, relative = payload
+            self._body_yaw_target = (self._body_yaw_target + yaw) if relative else yaw
+            self.state.update_activity()
+            logger.info("Body yaw target: %.0f°", float(np.rad2deg(self._body_yaw_target)))
+        elif cmd == "halt_body_yaw":
+            self._body_yaw_target = self._body_yaw_current
                 
     def _manage_move_queue(self, current_time: float) -> None:
         """Advance the move queue."""
@@ -553,6 +585,16 @@ class MovementManager:
             self._listening_antennas[1] * (1 - blend) + target[1] * blend,
         )
         
+    def _advance_body_yaw(self) -> float:
+        """Slew the persistent base yaw toward its target; return current value."""
+        delta = self._body_yaw_target - self._body_yaw_current
+        max_step = self.body_yaw_rate * self.target_period
+        if abs(delta) <= max_step:
+            self._body_yaw_current = self._body_yaw_target
+        else:
+            self._body_yaw_current += max_step if delta > 0 else -max_step
+        return self._body_yaw_current
+
     def _issue_command(self, head: NDArray, antennas: Tuple[float, float], body_yaw: float) -> None:
         """Send command to robot."""
         try:
@@ -566,6 +608,7 @@ class MovementManager:
         with self._shared_lock:
             self._shared_last_activity = self.state.last_activity_time
             self._shared_is_listening = self._is_listening
+            self._shared_body_yaw = (self._body_yaw_current, self._body_yaw_target)
             
     def start(self) -> None:
         """Start the control loop thread."""
@@ -623,9 +666,11 @@ class MovementManager:
             # Update thinking animation offsets
             self._update_thinking_offsets(loop_start)
             
-            # Compose pose
+            # Compose pose; moves carry transient yaw, the persistent base
+            # yaw (turn_body/body_sway) is added on top
             head, antennas, body_yaw = self._compose_pose(loop_start)
-            
+            body_yaw += self._advance_body_yaw()
+
             # Blend antennas for listening
             antennas = self._blend_antennas(antennas)
             
