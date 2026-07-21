@@ -48,8 +48,15 @@ GESTURE_MODE = os.getenv("CLAWBODY_GESTURE_MODE", "natural").strip().lower()
 # Echo defense: while robot audio is playing, mic frames quieter than this
 # RMS (float scale, 0..1) are dropped so the robot doesn't hear its own
 # speaker and spawn phantom turns. Louder speech still passes, so the user
-# can barge in. 0 disables the gate entirely.
+# can barge in. 0 disables the gate entirely. The same gate applies while
+# the base motor is slewing (its noise reaches the mics on the chassis).
 BARGE_IN_RMS = float(os.getenv("CLAWBODY_BARGE_IN_RMS", "0.06") or 0.0)
+
+# Server VAD tuning. The mics share a chassis with the speaker and motors,
+# so the default threshold errs high; lower it if the robot has trouble
+# hearing you, raise it if phantom turns persist (0..1, OpenAI default 0.5).
+VAD_THRESHOLD = float(os.getenv("CLAWBODY_VAD_THRESHOLD", "0.8") or 0.8)
+VAD_SILENCE_MS = int(float(os.getenv("CLAWBODY_VAD_SILENCE_MS", "700") or 700))
 
 # Sound-source orientation: when the user starts speaking, read Direction of
 # Arrival from the mic array and turn the head toward the voice.
@@ -349,9 +356,9 @@ OpenClaw has access to many capabilities you don't have directly.""",
                             "noise_reduction": {"type": "far_field"},
                             "turn_detection": {
                                 "type": "server_vad",
-                                "threshold": 0.6,
+                                "threshold": VAD_THRESHOLD,
                                 "prefix_padding_ms": 300,
-                                "silence_duration_ms": 600,
+                                "silence_duration_ms": VAD_SILENCE_MS,
                                 "create_response": True,
                                 "interrupt_response": True,
                             },
@@ -910,8 +917,16 @@ OpenClaw has access to many capabilities you don't have directly.""",
         if self._audio_play_start is None:
             return False
         now = asyncio.get_event_loop().time()
-        # 0.6s grace covers the device-side pipeline tail
-        return now < self._audio_play_start + self._audio_enqueued_s + 0.6
+        # 1.0s grace covers the device-side pipeline tail plus room reverb
+        return now < self._audio_play_start + self._audio_enqueued_s + 1.0
+
+    def _base_in_motion(self) -> bool:
+        """Is the base motor actively slewing (loud enough to fool the VAD)?"""
+        try:
+            mm = self.deps.movement_manager
+            return bool(mm is not None and mm.is_base_active())
+        except Exception:
+            return False
 
     async def receive(self, frame: Tuple[int, NDArray]) -> None:
         """Receive audio from the robot microphone."""
@@ -935,11 +950,12 @@ OpenClaw has access to many capabilities you don't have directly.""",
         elif audio.dtype != np.float32:
             audio = audio.astype(np.float32)
 
-        # Echo gate: while the robot's own speech is playing, drop quiet mic
-        # frames (mostly speaker bleed) so the server VAD doesn't spawn
-        # phantom user turns; loud speech still passes so the user can
-        # interrupt. BARGE_IN_RMS=0 disables the gate.
-        if BARGE_IN_RMS > 0.0 and self._robot_audio_playing():
+        # Echo/noise gate: while the robot's own speech is playing OR the
+        # base motor is slewing, drop quiet mic frames (speaker bleed and
+        # motor noise) so the server VAD doesn't spawn phantom user turns;
+        # loud speech still passes so the user can interrupt or call out to
+        # a searching robot. BARGE_IN_RMS=0 disables the gate.
+        if BARGE_IN_RMS > 0.0 and (self._robot_audio_playing() or self._base_in_motion()):
             rms = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
             if rms < BARGE_IN_RMS:
                 return

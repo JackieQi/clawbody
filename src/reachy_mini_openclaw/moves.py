@@ -71,6 +71,17 @@ EXTERNAL_YAW_HOLDOFF = 1.5
 # freeze). All our patterns are body-relative, so we clamp the composed
 # relative yaw with margin and then rotate by the base yaw before issuing.
 NECK_YAW_LIMIT = float(np.deg2rad(50.0))
+# Secondary offsets stack additively (face tracking + thinking + speech +
+# move macros), and the platform will physically drive the head shell into
+# the body if the sum pitches down too far (loud bump). Clamp the composed
+# pose to a safe envelope. Sign convention (per the SDK's look_at geometry
+# and the sleep pose): POSITIVE pitch = looking DOWN, the contact
+# direction; negative = up, which is mechanically freer and needed to
+# track standing people.
+HEAD_PITCH_UP_LIMIT = float(np.deg2rad(-40.0))
+HEAD_PITCH_DOWN_LIMIT = float(np.deg2rad(25.0))
+HEAD_ROLL_LIMIT = float(np.deg2rad(25.0))
+HEAD_Z_MIN, HEAD_Z_MAX = -0.020, 0.025  # metres
 # The base is NOT continuous: the wireless body motor hits a hard stop
 # around +/-157 deg (measured on hardware). Stay inside it with margin.
 # Base +/-150 plus neck +/-50 still covers the full circle (+/-200 deg of
@@ -153,11 +164,12 @@ class BreathingMove(Move):
 class HeadLookMove(Move):
     """Move to look in a specific direction."""
     
+    # Sign convention: positive pitch = down (toward the body), negative = up
     DIRECTIONS = {
         "left": (0, 0, 0, 0, 0, 30),      # yaw left
         "right": (0, 0, 0, 0, 0, -30),    # yaw right
-        "up": (0, 0, 10, 0, 15, 0),       # pitch up, z up
-        "down": (0, 0, -5, 0, -15, 0),    # pitch down, z down
+        "up": (0, 0, 10, 0, -15, 0),      # pitch up, z up
+        "down": (0, 0, -5, 0, 15, 0),     # pitch down, z down
         "front": (0, 0, 0, 0, 0, 0),      # neutral
     }
     
@@ -357,6 +369,8 @@ class MovementManager:
         self._shared_last_activity = self.state.last_activity_time
         self._shared_is_listening = False
         self._shared_body_yaw = (0.0, 0.0)  # (current, target)
+        self._base_active_until = float("-inf")
+        self._shared_base_active_until = float("-inf")
         
     def queue_move(self, move: Move) -> None:
         """Queue a primary move. Thread-safe."""
@@ -401,6 +415,15 @@ class MovementManager:
         """Get (current, target) base body yaw in radians. Thread-safe."""
         with self._shared_lock:
             return self._shared_body_yaw
+
+    def is_base_active(self) -> bool:
+        """True while the base motor is slewing (or just stopped). Thread-safe.
+
+        Used to gate quiet mic frames: the base motor's noise reaches the
+        chassis mics and can fool the server VAD into phantom user turns.
+        """
+        with self._shared_lock:
+            return self._now() < self._shared_base_active_until
         
     def is_idle(self) -> bool:
         """Check if robot has been idle. Thread-safe."""
@@ -556,8 +579,8 @@ class MovementManager:
         # Head offsets (radians / metres -- degrees=False, mm=False)
         # Slow yaw drift: ±12° at 0.15 Hz
         yaw = amp * np.deg2rad(12) * np.sin(2 * np.pi * 0.15 * t)
-        # Slight upward pitch: 6° base + 3° oscillation at 0.2 Hz
-        pitch = amp * (np.deg2rad(6) + np.deg2rad(3) * np.sin(2 * np.pi * 0.2 * t))
+        # Slight upward pitch (negative = up): 6° base + 3° oscillation at 0.2 Hz
+        pitch = -amp * (np.deg2rad(6) + np.deg2rad(3) * np.sin(2 * np.pi * 0.2 * t))
         # Gentle z bob: 3 mm at 0.12 Hz
         z = amp * 0.003 * np.sin(2 * np.pi * 0.12 * t)
         
@@ -739,19 +762,28 @@ class MovementManager:
             self._body_yaw_current = self._body_yaw_target
         else:
             self._body_yaw_current += max_step if delta > 0 else -max_step
+        if delta != 0.0:
+            # Motor noise lingers briefly after motion stops
+            self._base_active_until = self._now() + 0.4
         return self._body_yaw_current
 
-    def _clamp_neck_yaw(self, head: NDArray) -> NDArray:
-        """Keep the head's body-relative yaw within the neck's reachable range.
+    def _clamp_head_pose(self, head: NDArray) -> NDArray:
+        """Keep the composed head pose inside the safe mechanical envelope.
 
-        Prevents the daemon-side IK rejection (silent full freeze) that an
-        out-of-range composed pose would cause.
+        Yaw beyond the neck range makes the daemon reject the whole target
+        (silent full freeze); pitch/roll/z extremes drive the head shell
+        into the body with a loud bump. Offsets stack additively, so the
+        clamp guards the SUM of all sources.
         """
         euler = R.from_matrix(head[:3, :3]).as_euler("xyz")
-        if abs(euler[2]) <= NECK_YAW_LIMIT:
-            return head
-        euler[2] = float(np.clip(euler[2], -NECK_YAW_LIMIT, NECK_YAW_LIMIT))
-        head[:3, :3] = R.from_euler("xyz", euler).as_matrix()
+        clamped = [
+            float(np.clip(euler[0], -HEAD_ROLL_LIMIT, HEAD_ROLL_LIMIT)),
+            float(np.clip(euler[1], HEAD_PITCH_UP_LIMIT, HEAD_PITCH_DOWN_LIMIT)),
+            float(np.clip(euler[2], -NECK_YAW_LIMIT, NECK_YAW_LIMIT)),
+        ]
+        if not np.allclose(clamped, euler, atol=1e-9):
+            head[:3, :3] = R.from_euler("xyz", clamped).as_matrix()
+        head[2, 3] = float(np.clip(head[2, 3], HEAD_Z_MIN, HEAD_Z_MAX))
         return head
 
     def _rotate_head_by_base_yaw(self, head: NDArray, base_yaw: float) -> NDArray:
@@ -783,6 +815,7 @@ class MovementManager:
             self._shared_last_activity = self.state.last_activity_time
             self._shared_is_listening = self._is_listening
             self._shared_body_yaw = (self._body_yaw_current, self._body_yaw_target)
+            self._shared_base_active_until = self._base_active_until
             
     def start(self) -> None:
         """Start the control loop thread."""
@@ -851,7 +884,7 @@ class MovementManager:
             # on top. Clamp the neck twist so IK stays solvable, then express
             # the head in the world frame the daemon expects.
             head, antennas, body_yaw = self._compose_pose(loop_start)
-            head = self._clamp_neck_yaw(head)
+            head = self._clamp_head_pose(head)
             base_yaw = self._advance_body_yaw()
             head = self._rotate_head_by_base_yaw(head, base_yaw)
             body_yaw += base_yaw

@@ -94,7 +94,8 @@ class CameraWorker:
         # Scanning pattern: sinusoidal yaw sweep
         self._scan_yaw_amplitude = np.deg2rad(35)  # ±35 degrees
         self._scan_period = 8.0  # seconds for a full left-right-left cycle
-        self._scan_pitch_offset = np.deg2rad(3)  # slight upward tilt while scanning
+        # Slight upward tilt while scanning (negative pitch = up)
+        self._scan_pitch_offset = np.deg2rad(-3)
         # Start scanning immediately at boot (before any face has ever been seen)
         self._ever_seen_face = False
 
