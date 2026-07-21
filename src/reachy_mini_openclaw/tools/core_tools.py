@@ -562,11 +562,13 @@ async def _handle_emotion(args: dict, deps: ToolDependencies) -> dict:
                 start_pose = prev_move.target_pose
                 start_antennas = tuple(prev_move.target_antennas)
 
+            # 0.45s per step: quick enough to read as expressive, slow
+            # enough that the yaw reversals don't rock the base
             move = HeadLookMove(
                 direction=direction,
                 start_pose=start_pose,
                 start_antennas=start_antennas,
-                duration=0.32,
+                duration=0.45,
             )
             deps.movement_manager.queue_move(move)
             prev_move = move

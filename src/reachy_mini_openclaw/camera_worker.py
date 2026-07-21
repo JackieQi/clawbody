@@ -10,6 +10,7 @@ Provides:
 Based on pollen-robotics/reachy_mini_conversation_app camera worker.
 """
 
+import os
 import time
 import logging
 import threading
@@ -83,6 +84,16 @@ class CameraWorker:
         # At 25Hz with alpha=0.25, 95% convergence ~0.5s -- smooth enough to
         # filter detection noise, responsive enough to feel like eye contact.
         self.smoothing_alpha = 0.25
+
+        # Hard cap on how fast the tracked gaze may swing (deg/s). The EMA
+        # converges proportionally to the error, so a detection jump
+        # (reacquisition, a face popping up across the frame) would
+        # otherwise whip the head at several hundred deg/s -- hard enough
+        # to rock the base and risk toppling the robot.
+        self.tracking_max_speed = float(
+            os.getenv("CLAWBODY_TRACK_MAX_SPEED", "90") or 90
+        )
+        self._last_track_update_time: Optional[float] = None
         
         # Previous smoothed offsets for EMA calculation
         self._smoothed_offsets: List[float] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
@@ -328,6 +339,11 @@ class CameraWorker:
             # and keeps the neck twist within the mechanical +/-65 deg range.
             rotation[2] = _wrap_angle(rotation[2] - self._read_body_yaw())
 
+            # The axis-angle look-at pose carries a roll component for
+            # diagonal targets, but roll never changes where the camera
+            # points -- keep the head level instead of tilting it sideways.
+            rotation[0] = 0.0
+
             # Scale for smoother closed-loop convergence
             translation *= self.tracking_scale
             rotation *= self.tracking_scale
@@ -346,12 +362,27 @@ class CameraWorker:
             ]
             self._smoothed_offsets = smoothed
 
+            # Rate-limit the published rotations so no single tracking
+            # update can swing the head faster than tracking_max_speed
+            if self._last_track_update_time is None:
+                dt = 0.04
+            else:
+                dt = min(max(current_time - self._last_track_update_time, 0.02), 0.2)
+            self._last_track_update_time = current_time
+            max_step = np.deg2rad(self.tracking_max_speed) * dt
+            prev = self.face_tracking_offsets
+            limited = list(smoothed)
+            for i in range(3, 6):
+                delta = float(np.clip(smoothed[i] - prev[i], -max_step, max_step))
+                limited[i] = prev[i] + delta
+
             # Thread-safe update of face tracking offsets
             with self.face_tracking_lock:
-                self.face_tracking_offsets = smoothed
+                self.face_tracking_offsets = limited
 
         else:
             # No face detected
+            self._last_track_update_time = None
             if self._scanning:
                 # Already scanning -- keep sweeping the room
                 self._update_scanning_offsets(current_time)
