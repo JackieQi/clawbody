@@ -58,6 +58,14 @@ BARGE_IN_RMS = float(os.getenv("CLAWBODY_BARGE_IN_RMS", "0.06") or 0.0)
 VAD_THRESHOLD = float(os.getenv("CLAWBODY_VAD_THRESHOLD", "0.8") or 0.8)
 VAD_SILENCE_MS = int(float(os.getenv("CLAWBODY_VAD_SILENCE_MS", "700") or 700))
 
+# Always-on mic noise floor: frames below this RMS never reach the server,
+# so hum/servo whine can't become phantom turns. 0 disables.
+MIC_FLOOR_RMS = float(os.getenv("CLAWBODY_MIC_FLOOR_RMS", "0.02") or 0.0)
+
+# Log mic RMS statistics every N seconds (0 disables); used to diagnose
+# what the VAD is actually hearing on this chassis.
+MIC_STATS_INTERVAL = float(os.getenv("CLAWBODY_MIC_STATS_S", "5") or 0.0)
+
 # Sound-source orientation: when the user starts speaking, read Direction of
 # Arrival from the mic array and turn the head toward the voice.
 # The ReSpeaker reports 0=left, pi/2=front, pi=right across a 180° arc.
@@ -234,6 +242,11 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         self._current_item_id: Optional[str] = None  # assistant item being spoken
         self._audio_play_start: Optional[float] = None  # wall time first audio of response
         self._audio_enqueued_s = 0.0  # seconds of audio enqueued for current response
+
+        # Mic diagnostics: what the VAD actually hears on this chassis
+        self._last_mic_rms = 0.0
+        self._mic_stats = [0.0, 0.0, 0, 0]  # [sum, max, frames, dropped]
+        self._mic_stats_t = 0.0
 
         # Strong refs to fire-and-forget tasks (event loop keeps only weak refs)
         self._bg_tasks: set = set()
@@ -448,7 +461,7 @@ OpenClaw has access to many capabilities you don't have directly.""",
             if self.deps.head_wobbler is not None:
                 self.deps.head_wobbler.reset()
             self.deps.movement_manager.set_listening(True)
-            logger.info("User started speaking")
+            logger.info("User started speaking (mic RMS %.4f)", self._last_mic_rms)
 
             # Turn the head toward the voice (Direction of Arrival)
             if DOA_MODE == "on":
@@ -920,6 +933,28 @@ OpenClaw has access to many capabilities you don't have directly.""",
         # 1.0s grace covers the device-side pipeline tail plus room reverb
         return now < self._audio_play_start + self._audio_enqueued_s + 1.0
 
+    def _mic_stats_update(self, rms: float, dropped: bool) -> None:
+        """Accumulate mic RMS stats and periodically log them."""
+        if MIC_STATS_INTERVAL <= 0.0:
+            return
+        s = self._mic_stats
+        s[0] += rms
+        s[1] = max(s[1], rms)
+        s[2] += 1
+        s[3] += int(dropped)
+        now = asyncio.get_event_loop().time()
+        if self._mic_stats_t == 0.0:
+            self._mic_stats_t = now
+            return
+        if now - self._mic_stats_t >= MIC_STATS_INTERVAL and s[2] > 0:
+            logger.info(
+                "Mic stats: avg RMS %.4f, max %.4f, %d frames, %d dropped (playing=%s base=%s)",
+                s[0] / s[2], s[1], s[2], s[3],
+                self._robot_audio_playing(), self._base_in_motion(),
+            )
+            self._mic_stats = [0.0, 0.0, 0, 0]
+            self._mic_stats_t = now
+
     def _base_in_motion(self) -> bool:
         """Is the base motor actively slewing (loud enough to fool the VAD)?"""
         try:
@@ -950,15 +985,25 @@ OpenClaw has access to many capabilities you don't have directly.""",
         elif audio.dtype != np.float32:
             audio = audio.astype(np.float32)
 
+        rms = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
+        self._last_mic_rms = rms
+        dropped = False
+
+        # Always-on floor: hum and servo whine never reach the server VAD
+        if MIC_FLOOR_RMS > 0.0 and rms < MIC_FLOOR_RMS:
+            dropped = True
         # Echo/noise gate: while the robot's own speech is playing OR the
         # base motor is slewing, drop quiet mic frames (speaker bleed and
         # motor noise) so the server VAD doesn't spawn phantom user turns;
         # loud speech still passes so the user can interrupt or call out to
         # a searching robot. BARGE_IN_RMS=0 disables the gate.
-        if BARGE_IN_RMS > 0.0 and (self._robot_audio_playing() or self._base_in_motion()):
-            rms = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
+        elif BARGE_IN_RMS > 0.0 and (self._robot_audio_playing() or self._base_in_motion()):
             if rms < BARGE_IN_RMS:
-                return
+                dropped = True
+
+        self._mic_stats_update(rms, dropped)
+        if dropped:
+            return
                 
         # Resample to OpenAI sample rate
         if input_sr != OPENAI_SAMPLE_RATE:
