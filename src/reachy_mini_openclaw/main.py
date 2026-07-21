@@ -422,7 +422,17 @@ class ClawBodyCore:
         if self.camera_worker is not None:
             self.movement_manager.camera_worker = self.camera_worker
             logger.info("Face tracking connected to movement system")
-        
+
+        # Direct body-yaw mode: in automatic mode the daemon moves the base
+        # on its own (IK modulation), fighting our body-follow control. The
+        # MovementManager owns both the neck-twist clamp and the +/-150 deg
+        # base range, so direct pass-through is safe. Restored in stop().
+        try:
+            self.robot.set_automatic_body_yaw(False)
+            logger.info("Body yaw direct mode enabled (base range +/-150 deg)")
+        except Exception as e:
+            logger.warning("Could not enable body yaw direct mode: %s", e)
+
         # Start movement system
         logger.info("Starting movement system...")
         self.movement_manager.start()
@@ -474,6 +484,12 @@ class ClawBodyCore:
         # Stop movement system
         self.head_wobbler.stop()
         self.movement_manager.stop()
+
+        # Hand the daemon back its default body-yaw behavior
+        try:
+            self.robot.set_automatic_body_yaw(True)
+        except Exception as e:
+            logger.debug("Restore automatic body yaw: %s", e)
         
         # Stop vision manager
         if self.vision_manager is not None:

@@ -26,6 +26,11 @@ from reachy_mini.utils.interpolation import linear_pose_interpolation
 logger = logging.getLogger(__name__)
 
 
+def _wrap_angle(angle: float) -> float:
+    """Wrap an angle to (-pi, pi]."""
+    return float((angle + np.pi) % (2.0 * np.pi) - np.pi)
+
+
 class CameraWorker:
     """Thread-safe camera worker with frame buffering and face tracking.
     
@@ -115,6 +120,17 @@ class CameraWorker:
         with self.face_tracking_lock:
             offsets = self.face_tracking_offsets
             return (offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5])
+
+    def _read_body_yaw(self) -> float:
+        """Read the present base body yaw (joints[0]) in radians.
+
+        A cached microsecond read; falls back to 0.0 if unavailable.
+        """
+        try:
+            joints, _ = self.reachy_mini.get_current_joint_positions()
+            return float(joints[0])
+        except Exception:
+            return 0.0
 
     def is_face_tracked(self, within: float = 0.5) -> bool:
         """True when a face was seen within `within` seconds (thread-safe).
@@ -304,6 +320,12 @@ class CameraWorker:
             # Extract translation and rotation from the target pose
             translation = target_pose[:3, 3]
             rotation = R.from_matrix(target_pose[:3, :3]).as_euler("xyz", degrees=False)
+
+            # look_at_image returns the gaze in the world frame (it already
+            # contains the current body rotation). Offsets must be
+            # body-relative: the movement manager re-adds its own body yaw
+            # and keeps the neck twist within the mechanical +/-65 deg range.
+            rotation[2] = _wrap_angle(rotation[2] - self._read_body_yaw())
 
             # Scale for smoother closed-loop convergence
             translation *= self.tracking_scale

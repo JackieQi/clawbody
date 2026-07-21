@@ -212,13 +212,13 @@ TOOL_SPECS = [
     {
         "type": "function",
         "name": "turn_body",
-        "description": "Rotate the robot's body/base by a relative angle. Use for 'turn around' (180), 'turn left a bit' (45), or a full spin (360). Positive degrees turn left (counterclockwise), negative turn right.",
+        "description": "Rotate the robot's body/base by a relative angle. Use for 'turn around' (180) or 'turn left a bit' (45). Positive degrees turn left (counterclockwise), negative turn right. The base has a hard stop at +/-150 degrees from center, so it cannot spin continuously; large turns clamp at the stop.",
         "parameters": {
             "type": "object",
             "properties": {
                 "degrees": {
                     "type": "number",
-                    "description": "Relative turn in degrees; positive = left, negative = right. Range -360 to 360."
+                    "description": "Relative turn in degrees; positive = left, negative = right. The reachable base range is -150 to 150 from center."
                 }
             },
             "required": ["degrees"]

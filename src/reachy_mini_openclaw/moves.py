@@ -28,6 +28,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.spatial.transform import Rotation as R
 from reachy_mini import ReachyMini
 from reachy_mini.motion.move import Move
 from reachy_mini.utils import create_head_pose
@@ -59,9 +60,22 @@ BODY_FOLLOW_MAX_SPEED = float(np.deg2rad(
 BODY_SEARCH_ENABLED = _env_flag("CLAWBODY_BODY_SEARCH")
 BODY_SEARCH_DELAY = 3.0  # seconds of head-only scanning before the base joins
 BODY_SEARCH_SPEED = float(np.deg2rad(20.0))
-BODY_SEARCH_MAX_TURN = float(np.deg2rad(400.0))  # a bit over one full turn
+# Enough for a wall-to-wall unwind (300 deg) even after a partial first leg
+BODY_SEARCH_MAX_TURN = float(np.deg2rad(500.0))
 # Pause body-follow briefly after an explicit turn_body/body_sway command
 EXTERNAL_YAW_HOLDOFF = 1.5
+
+# The daemon interprets head poses in the world frame; the neck (Stewart
+# platform) can only realize ~+/-65 deg of yaw relative to the base, and an
+# out-of-range command makes the daemon reject the ENTIRE target (silent
+# freeze). All our patterns are body-relative, so we clamp the composed
+# relative yaw with margin and then rotate by the base yaw before issuing.
+NECK_YAW_LIMIT = float(np.deg2rad(50.0))
+# The base is NOT continuous: the wireless body motor hits a hard stop
+# around +/-157 deg (measured on hardware). Stay inside it with margin.
+# Base +/-150 plus neck +/-50 still covers the full circle (+/-200 deg of
+# gaze); the body search unwinds the long way around to cross the seam.
+BODY_YAW_RANGE = float(np.deg2rad(150.0))
 
 # Type definitions
 FullBodyPose = Tuple[NDArray[np.float32], Tuple[float, float], float]
@@ -327,6 +341,9 @@ class MovementManager:
         self._body_yaw_current = 0.0
         self._body_yaw_target = 0.0
         self.body_yaw_rate = float(np.deg2rad(120.0))  # max slew speed, rad/s
+        # Hard range of the base motor; None only for tests
+        self.body_yaw_limit: Optional[float] = BODY_YAW_RANGE
+        self._last_cmd_error_log = float("-inf")
 
         # Body-follow face tracking state
         self._body_follow_active = False
@@ -492,6 +509,19 @@ class MovementManager:
                 "left" if self._last_face_side > 0 else "right",
             )
         step = BODY_SEARCH_SPEED * self.target_period
+        # The base can't cross its hard stop; when the preferred side is
+        # blocked, unwind the long way around so the search still covers the
+        # sector behind the seam
+        if self.body_yaw_limit is not None:
+            next_yaw = self._body_yaw_current + self._last_face_side * step
+            if abs(next_yaw) > self.body_yaw_limit - np.deg2rad(2.0) and (
+                np.sign(next_yaw) == np.sign(self._last_face_side)
+            ):
+                self._last_face_side = -self._last_face_side
+                logger.info(
+                    "Base at its rotation stop; search unwinding %s",
+                    "left" if self._last_face_side > 0 else "right",
+                )
         self._search_turned += step
         self._body_yaw_target = self._body_yaw_current + self._last_face_side * step
 
@@ -699,6 +729,10 @@ class MovementManager:
         
     def _advance_body_yaw(self) -> float:
         """Slew the persistent base yaw toward its target; return current value."""
+        if self.body_yaw_limit is not None:
+            self._body_yaw_target = float(np.clip(
+                self._body_yaw_target, -self.body_yaw_limit, self.body_yaw_limit
+            ))
         delta = self._body_yaw_target - self._body_yaw_current
         max_step = self.body_yaw_rate * self.target_period
         if abs(delta) <= max_step:
@@ -707,13 +741,41 @@ class MovementManager:
             self._body_yaw_current += max_step if delta > 0 else -max_step
         return self._body_yaw_current
 
+    def _clamp_neck_yaw(self, head: NDArray) -> NDArray:
+        """Keep the head's body-relative yaw within the neck's reachable range.
+
+        Prevents the daemon-side IK rejection (silent full freeze) that an
+        out-of-range composed pose would cause.
+        """
+        euler = R.from_matrix(head[:3, :3]).as_euler("xyz")
+        if abs(euler[2]) <= NECK_YAW_LIMIT:
+            return head
+        euler[2] = float(np.clip(euler[2], -NECK_YAW_LIMIT, NECK_YAW_LIMIT))
+        head[:3, :3] = R.from_euler("xyz", euler).as_matrix()
+        return head
+
+    def _rotate_head_by_base_yaw(self, head: NDArray, base_yaw: float) -> NDArray:
+        """Express the body-relative head pose in the daemon's world frame."""
+        if base_yaw == 0.0:
+            return head
+        rot = R.from_euler("z", base_yaw).as_matrix()
+        rotated = head.copy()
+        rotated[:3, :3] = rot @ head[:3, :3]
+        rotated[:3, 3] = rot @ head[:3, 3]
+        return rotated
+
     def _issue_command(self, head: NDArray, antennas: Tuple[float, float], body_yaw: float) -> None:
         """Send command to robot."""
         try:
             self.current_robot.set_target(head=head, antennas=antennas, body_yaw=body_yaw)
             self._last_commanded_pose = (head.copy(), antennas, body_yaw)
         except Exception as e:
-            logger.debug("set_target failed: %s", e)
+            now = self._now()
+            if now - self._last_cmd_error_log > 5.0:
+                self._last_cmd_error_log = now
+                logger.warning("set_target failed: %s", e)
+            else:
+                logger.debug("set_target failed: %s", e)
             
     def _publish_shared_state(self) -> None:
         """Update shared state for external queries."""
@@ -745,14 +807,17 @@ class MovementManager:
         self._thread.join(timeout=2.0)
         self._thread = None
         
-        # Reset to neutral
+        # Reset to neutral. Unwind the base to the nearest full turn rather
+        # than absolute zero: head-pose interpolation wraps at +/-180 deg, so
+        # a long unwind would transiently exceed the neck range.
         try:
             neutral = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
+            reset_yaw = 2.0 * np.pi * round(self._body_yaw_current / (2.0 * np.pi))
             self.current_robot.goto_target(
                 head=neutral,
                 antennas=[0.0, 0.0],
                 duration=2.0,
-                body_yaw=0.0,
+                body_yaw=reset_yaw,
             )
             logger.info("Reset to neutral position")
         except Exception as e:
@@ -781,10 +846,15 @@ class MovementManager:
             # Update thinking animation offsets
             self._update_thinking_offsets(loop_start)
             
-            # Compose pose; moves carry transient yaw, the persistent base
-            # yaw (turn_body/body_sway) is added on top
+            # Compose the body-relative pose; moves carry transient yaw, the
+            # persistent base yaw (turn_body/body_sway/body-follow) is added
+            # on top. Clamp the neck twist so IK stays solvable, then express
+            # the head in the world frame the daemon expects.
             head, antennas, body_yaw = self._compose_pose(loop_start)
-            body_yaw += self._advance_body_yaw()
+            head = self._clamp_neck_yaw(head)
+            base_yaw = self._advance_body_yaw()
+            head = self._rotate_head_by_base_yaw(head, base_yaw)
+            body_yaw += base_yaw
 
             # Blend antennas for listening
             antennas = self._blend_antennas(antennas)
