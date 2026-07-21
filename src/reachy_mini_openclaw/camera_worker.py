@@ -116,6 +116,27 @@ class CameraWorker:
             offsets = self.face_tracking_offsets
             return (offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5])
 
+    def is_face_tracked(self, within: float = 0.5) -> bool:
+        """True when a face was seen within `within` seconds (thread-safe).
+
+        Scanning does not count: the offsets then hold the sweep pattern,
+        not a real face position.
+        """
+        if not self.is_head_tracking_enabled or self.head_tracker is None:
+            return False
+        if self._scanning:
+            return False
+        last_seen = self.last_face_detected_time
+        return last_seen is not None and (time.time() - last_seen) < within
+
+    def is_scanning(self) -> bool:
+        """True while sweeping the room looking for a face (thread-safe)."""
+        return self._scanning and self.is_head_tracking_enabled
+
+    def has_seen_face(self) -> bool:
+        """True once any face has been detected since startup (thread-safe)."""
+        return self._ever_seen_face
+
     def set_head_tracking_enabled(self, enabled: bool) -> None:
         """Enable/disable head tracking.
         

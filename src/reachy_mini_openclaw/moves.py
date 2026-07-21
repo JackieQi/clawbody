@@ -18,6 +18,7 @@ Based on the movement systems from:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -36,6 +37,31 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 CONTROL_LOOP_FREQUENCY_HZ = 100.0
+
+
+def _env_flag(name: str, default: str = "on") -> bool:
+    return os.getenv(name, default).strip().lower() not in ("off", "0", "false", "no")
+
+
+# Body-follow face tracking (wireless base): when the head must yaw far to
+# keep a tracked face in view, the base rotates underneath it so tracking
+# continues past the head's range (the base yaw is continuous 360°). When
+# the face is lost and the head-only scan comes up empty, the base joins
+# the search by slowly turning toward where the face was last seen.
+BODY_FOLLOW_ENABLED = _env_flag("CLAWBODY_BODY_FOLLOW")
+# Head yaw (degrees) that engages the base; hysteresis releases it near center
+BODY_FOLLOW_START_DEG = float(os.getenv("CLAWBODY_BODY_FOLLOW_START", "12") or 12)
+BODY_FOLLOW_STOP_DEG = 3.0
+# Proportional gain (rad/s of base speed per rad of head yaw) and speed cap
+BODY_FOLLOW_GAIN = float(os.getenv("CLAWBODY_BODY_FOLLOW_GAIN", "2.5") or 2.5)
+BODY_FOLLOW_MAX_SPEED = float(np.deg2rad(
+    float(os.getenv("CLAWBODY_BODY_FOLLOW_MAX_SPEED", "60") or 60)))
+BODY_SEARCH_ENABLED = _env_flag("CLAWBODY_BODY_SEARCH")
+BODY_SEARCH_DELAY = 3.0  # seconds of head-only scanning before the base joins
+BODY_SEARCH_SPEED = float(np.deg2rad(20.0))
+BODY_SEARCH_MAX_TURN = float(np.deg2rad(400.0))  # a bit over one full turn
+# Pause body-follow briefly after an explicit turn_body/body_sway command
+EXTERNAL_YAW_HOLDOFF = 1.5
 
 # Type definitions
 FullBodyPose = Tuple[NDArray[np.float32], Tuple[float, float], float]
@@ -302,6 +328,13 @@ class MovementManager:
         self._body_yaw_target = 0.0
         self.body_yaw_rate = float(np.deg2rad(120.0))  # max slew speed, rad/s
 
+        # Body-follow face tracking state
+        self._body_follow_active = False
+        self._last_face_side = 1.0  # +1 = face was to the left, -1 = right
+        self._search_started: Optional[float] = None
+        self._search_turned = 0.0
+        self._external_yaw_cmd_time = float("-inf")
+
         # Shared state lock
         self._shared_lock = threading.Lock()
         self._shared_last_activity = self.state.last_activity_time
@@ -384,7 +417,84 @@ class MovementManager:
         else:
             # No camera worker, use neutral offsets
             self.state.face_tracking_offsets = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-            
+
+    def _update_body_follow(self, current_time: float) -> None:
+        """Rotate the base so face tracking works beyond the head's yaw range.
+
+        While a face is tracked, head-yaw excursions past the start threshold
+        recruit the base with proportional velocity; the loop closes through
+        the camera (as the base turns toward the face, the head offset
+        shrinks), so the robot ends up squarely facing the person. When the
+        face is lost and head-only scanning stays empty, the base slowly
+        turns toward the side where the face was last seen, up to about one
+        full turn. Explicit yaw commands (turn_body/body_sway) and
+        choreographed moves take precedence.
+        """
+        cw = self.camera_worker
+        if cw is None or not (BODY_FOLLOW_ENABLED or BODY_SEARCH_ENABLED):
+            return
+        if not hasattr(cw, "is_face_tracked"):
+            return
+
+        # Yield to explicit rotations and non-idle moves (dances/emotions)
+        if (
+            current_time - self._external_yaw_cmd_time < EXTERNAL_YAW_HOLDOFF
+            or abs(self._body_yaw_target - self._body_yaw_current) > np.deg2rad(3.0)
+            or (self.state.current_move is not None and not self._breathing_active)
+        ):
+            self._body_follow_active = False
+            self._search_started = None
+            return
+
+        if BODY_FOLLOW_ENABLED and cw.is_face_tracked():
+            self._search_started = None
+            yaw_off = float(self.state.face_tracking_offsets[5])
+            if abs(yaw_off) > np.deg2rad(3.0):
+                self._last_face_side = 1.0 if yaw_off > 0 else -1.0
+            if not self._body_follow_active:
+                if abs(yaw_off) < np.deg2rad(BODY_FOLLOW_START_DEG):
+                    return
+                self._body_follow_active = True
+                logger.debug(
+                    "Body follow engaged (head yaw %.0f°)", float(np.rad2deg(yaw_off))
+                )
+            elif abs(yaw_off) < np.deg2rad(BODY_FOLLOW_STOP_DEG):
+                self._body_follow_active = False
+                return
+            speed = float(np.clip(
+                BODY_FOLLOW_GAIN * yaw_off,
+                -BODY_FOLLOW_MAX_SPEED,
+                BODY_FOLLOW_MAX_SPEED,
+            ))
+            # Keep the target glued just ahead of current so the slew in
+            # _advance_body_yaw moves at exactly this speed with no windup
+            self._body_yaw_target = self._body_yaw_current + speed * self.target_period
+            return
+
+        self._body_follow_active = False
+
+        # Face lost: let the base join the search after the head-only scan
+        # has come up empty for a while
+        if not (BODY_SEARCH_ENABLED and cw.is_scanning() and cw.has_seen_face()):
+            self._search_started = None
+            return
+        if self._search_started is None:
+            self._search_started = current_time
+            self._search_turned = 0.0
+            return
+        if current_time - self._search_started < BODY_SEARCH_DELAY:
+            return
+        if self._search_turned >= BODY_SEARCH_MAX_TURN:
+            return
+        if self._search_turned == 0.0:
+            logger.info(
+                "Base joining face search, turning %s",
+                "left" if self._last_face_side > 0 else "right",
+            )
+        step = BODY_SEARCH_SPEED * self.target_period
+        self._search_turned += step
+        self._body_yaw_target = self._body_yaw_current + self._last_face_side * step
+
     def _update_thinking_offsets(self, current_time: float) -> None:
         """Compute thinking animation as secondary offsets.
         
@@ -472,10 +582,12 @@ class MovementManager:
         elif cmd == "set_body_yaw":
             yaw, relative = payload
             self._body_yaw_target = (self._body_yaw_target + yaw) if relative else yaw
+            self._external_yaw_cmd_time = current_time
             self.state.update_activity()
             logger.info("Body yaw target: %.0f°", float(np.rad2deg(self._body_yaw_target)))
         elif cmd == "halt_body_yaw":
             self._body_yaw_target = self._body_yaw_current
+            self._external_yaw_cmd_time = current_time
                 
     def _manage_move_queue(self, current_time: float) -> None:
         """Advance the move queue."""
@@ -662,7 +774,10 @@ class MovementManager:
             
             # Update face tracking offsets from camera worker
             self._update_face_tracking(loop_start)
-            
+
+            # Recruit the base when the head alone can't keep the face in view
+            self._update_body_follow(loop_start)
+
             # Update thinking animation offsets
             self._update_thinking_offsets(loop_start)
             
