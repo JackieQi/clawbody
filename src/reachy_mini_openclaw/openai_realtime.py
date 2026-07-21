@@ -52,9 +52,13 @@ GESTURE_MODE = os.getenv("CLAWBODY_GESTURE_MODE", "natural").strip().lower()
 # the base motor is slewing (its noise reaches the mics on the chassis).
 BARGE_IN_RMS = float(os.getenv("CLAWBODY_BARGE_IN_RMS", "0.06") or 0.0)
 
-# Server VAD tuning. The mics share a chassis with the speaker and motors,
-# so the default threshold errs high; lower it if the robot has trouble
-# hearing you, raise it if phantom turns persist (0..1, OpenAI default 0.5).
+# Turn detection. The chassis mics pick up servo/antenna transients as
+# loud as real speech (measured up to RMS 0.47), so energy-based server
+# VAD spawns phantom turns no matter the threshold. semantic_vad (default)
+# has the model judge whether the audio is actually speech; set
+# CLAWBODY_VAD_MODE=server to fall back to energy VAD with the knobs below.
+VAD_MODE = os.getenv("CLAWBODY_VAD_MODE", "semantic").strip().lower()
+VAD_EAGERNESS = os.getenv("CLAWBODY_VAD_EAGERNESS", "low").strip().lower()
 VAD_THRESHOLD = float(os.getenv("CLAWBODY_VAD_THRESHOLD", "0.8") or 0.8)
 VAD_SILENCE_MS = int(float(os.getenv("CLAWBODY_VAD_SILENCE_MS", "700") or 700))
 
@@ -367,14 +371,23 @@ OpenClaw has access to many capabilities you don't have directly.""",
                             },
                             # Robot mic sits away from the speaker's mouth
                             "noise_reduction": {"type": "far_field"},
-                            "turn_detection": {
-                                "type": "server_vad",
-                                "threshold": VAD_THRESHOLD,
-                                "prefix_padding_ms": 300,
-                                "silence_duration_ms": VAD_SILENCE_MS,
-                                "create_response": True,
-                                "interrupt_response": True,
-                            },
+                            "turn_detection": (
+                                {
+                                    "type": "semantic_vad",
+                                    "eagerness": VAD_EAGERNESS,
+                                    "create_response": True,
+                                    "interrupt_response": True,
+                                }
+                                if VAD_MODE == "semantic"
+                                else {
+                                    "type": "server_vad",
+                                    "threshold": VAD_THRESHOLD,
+                                    "prefix_padding_ms": 300,
+                                    "silence_duration_ms": VAD_SILENCE_MS,
+                                    "create_response": True,
+                                    "interrupt_response": True,
+                                }
+                            ),
                         },
                         "output": {
                             "format": {"type": "audio/pcm", "rate": OPENAI_SAMPLE_RATE},

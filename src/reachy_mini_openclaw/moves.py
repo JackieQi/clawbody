@@ -117,11 +117,13 @@ class BreathingMove(Move):
         self.neutral_head_pose = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
         self.neutral_antennas = np.array([0.0, 0.0])
         
-        # Breathing parameters
+        # Breathing parameters. Antenna sway is kept small and slow: the
+        # antenna servos sit right next to the mic array, and their steps
+        # register as speech-loud transients that fool turn detection.
         self.breathing_z_amplitude = 0.005  # 5mm gentle movement
         self.breathing_frequency = 0.1  # Hz
-        self.antenna_sway_amplitude = np.deg2rad(15)  # degrees
-        self.antenna_frequency = 0.5  # Hz
+        self.antenna_sway_amplitude = np.deg2rad(8)  # degrees
+        self.antenna_frequency = 0.3  # Hz
         
     @property
     def duration(self) -> float:
@@ -586,10 +588,10 @@ class MovementManager:
         
         self.state.thinking_offsets = (0.0, 0.0, z, 0.0, pitch, yaw)
         
-        # Antenna offsets: asymmetric scan (phase offset creates "searching" feel)
-        # ±20° at 0.4 Hz, right antenna lags left by ~70° of phase
-        left_ant = amp * np.deg2rad(20) * np.sin(2 * np.pi * 0.4 * t)
-        right_ant = amp * np.deg2rad(20) * np.sin(2 * np.pi * 0.4 * t + 1.2)
+        # Antenna offsets: asymmetric scan (phase offset creates "searching"
+        # feel); kept modest to limit servo noise near the mics
+        left_ant = amp * np.deg2rad(12) * np.sin(2 * np.pi * 0.4 * t)
+        right_ant = amp * np.deg2rad(12) * np.sin(2 * np.pi * 0.4 * t + 1.2)
         self._thinking_antenna_offsets = (left_ant, right_ant)
         
     def _handle_command(self, cmd: str, payload: Any, current_time: float) -> None:
