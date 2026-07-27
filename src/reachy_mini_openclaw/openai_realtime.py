@@ -737,7 +737,7 @@ OpenClaw has access to many capabilities you don't have directly.""",
 
         # Greetings -> friendly wave-ish
         if _find_cue(t, ["哈囉", "你好", "嗨", "안녕", "hello", "hi", "hey", "good morning", "good evening"]):
-            await self._queue_headlook_sequence(["right", "left", "front"], [0.22, 0.22, 0.45])
+            await self._queue_gesture("sway")
             return
 
         # Weather -> look up
@@ -752,7 +752,7 @@ OpenClaw has access to many capabilities you don't have directly.""",
 
         # Thanks -> nod
         if _find_cue(t, ["謝", "thanks", "thank you", "thx"]):
-            await self._queue_headlook_sequence(["down", "up", "front"], [0.22, 0.22, 0.45])
+            await self._queue_gesture("nod")
             return
 
         # Questions -> curious glance
@@ -797,10 +797,7 @@ OpenClaw has access to many capabilities you don't have directly.""",
                 self._gesture_fired["neg"] = True
                 self._gesture_last_t = now
                 self._gesture_processed_len = len(self._gesture_buffer)
-                await self._queue_headlook_sequence(
-                    ["left", "right", "left", "right", "left", "front"],
-                    [0.22, 0.22, 0.22, 0.22, 0.22, 0.35],
-                )
+                await self._queue_gesture("shake")
                 return
 
         # 3) Positive -> nod
@@ -809,10 +806,7 @@ OpenClaw has access to many capabilities you don't have directly.""",
                 self._gesture_fired["pos"] = True
                 self._gesture_last_t = now
                 self._gesture_processed_len = len(self._gesture_buffer)
-                await self._queue_headlook_sequence(
-                    ["down", "up", "down", "up", "front"],
-                    [0.22, 0.22, 0.22, 0.22, 0.40],
-                )
+                await self._queue_gesture("nod")
                 return
 
         # 4) Explicit stage directions (assistant narrates the gesture);
@@ -822,27 +816,15 @@ OpenClaw has access to many capabilities you don't have directly.""",
             self._gesture_last_t = now
             self._gesture_processed_len = len(self._gesture_buffer)
             if hit in ("搖頭", "shake my head"):
-                await self._queue_headlook_sequence(
-                    ["left", "right", "left", "right", "left", "front"],
-                    [0.22, 0.22, 0.22, 0.22, 0.22, 0.35],
-                )
+                await self._queue_gesture("shake")
             elif hit in ("點頭", "nod"):
-                await self._queue_headlook_sequence(
-                    ["down", "up", "down", "up", "front"],
-                    [0.22, 0.22, 0.22, 0.22, 0.40],
-                )
+                await self._queue_gesture("nod")
             elif hit in ("彈跳", "跳起來", "bounce"):
-                await self._queue_headlook_sequence(
-                    ["down", "up", "down", "front"],
-                    [0.20, 0.20, 0.20, 0.35],
-                )
+                await self._queue_gesture("bounce")
             else:
                 # Body sway approximated with a head sway; the body_sway tool
                 # remains available for explicit requests
-                await self._queue_headlook_sequence(
-                    ["right", "left", "right", "front"],
-                    [0.22, 0.22, 0.22, 0.45],
-                )
+                await self._queue_gesture("sway")
             return
 
         # 5) Question -> gentle side glance
@@ -851,10 +833,7 @@ OpenClaw has access to many capabilities you don't have directly.""",
                 self._gesture_fired["q"] = True
                 self._gesture_last_t = now
                 self._gesture_processed_len = len(self._gesture_buffer)
-                await self._queue_headlook_sequence(
-                    ["right", "left", "right", "front"],
-                    [0.22, 0.22, 0.22, 0.45],
-                )
+                await self._queue_headlook_sequence(["right", "front"], [0.5, 0.7])
                 return
 
     async def _turn_toward_voice(self) -> None:
@@ -885,15 +864,16 @@ OpenClaw has access to many capabilities you don't have directly.""",
             if abs(yaw_deg) < DOA_DEADBAND_DEG:
                 return  # already roughly facing the speaker
 
-            from reachy_mini_openclaw.moves import HeadLookMove
+            from reachy_mini_openclaw.moves import HeadLookMove, move_start_state
 
-            _, current_ant = robot.get_current_joint_positions()
-            current_head = robot.get_current_head_pose()
+            start_pose, start_antennas = move_start_state(self.deps.movement_manager)
             move = HeadLookMove(
                 direction="front",
-                start_pose=current_head,
-                start_antennas=tuple(current_ant),
-                duration=0.5,
+                start_pose=start_pose,
+                start_antennas=start_antennas,
+                # 0.8s rather than 0.5s: a DoA turn can be the full +/-60 deg
+                # and the head should swing round to you, not snap round
+                duration=0.8,
                 target_yaw_deg=yaw_deg,
             )
             self.deps.movement_manager.queue_move(move)
@@ -908,20 +888,21 @@ OpenClaw has access to many capabilities you don't have directly.""",
         back-to-back queued moves stay continuous instead of snapping back
         to the pose the robot had at queue time.
         """
-        from reachy_mini_openclaw.moves import HeadLookMove
+        from reachy_mini_openclaw.moves import HeadLookMove, move_start_state
 
-        if not getattr(self.deps, "robot", None):
+        mm = getattr(self.deps, "movement_manager", None)
+        if mm is None:
             return
+
+        # Body-relative start pose, never the measured world-frame one; see
+        # move_start_state for why that distinction snaps the head
+        start_pose, start_antennas = move_start_state(mm)
 
         prev_move = None
         for i, direction in enumerate(directions):
             duration = durations[i] if i < len(durations) else durations[-1]
             try:
-                if prev_move is None:
-                    _, current_ant = self.deps.robot.get_current_joint_positions()
-                    start_pose = self.deps.robot.get_current_head_pose()
-                    start_antennas = tuple(current_ant)
-                else:
+                if prev_move is not None:
                     start_pose = prev_move.target_pose
                     start_antennas = tuple(prev_move.target_antennas)
                 move = HeadLookMove(
@@ -930,11 +911,35 @@ OpenClaw has access to many capabilities you don't have directly.""",
                     start_antennas=start_antennas,
                     duration=float(duration),
                 )
-                self.deps.movement_manager.queue_move(move)
+                mm.queue_move(move)
                 prev_move = move
-            except Exception:
-                # If pose read fails, skip gracefully
+            except Exception as e:
+                logger.debug("Head look sequence aborted: %s", e)
                 return
+
+    async def _queue_gesture(self, gesture: str) -> None:
+        """Queue a nod / shake / bounce as a smooth oscillation.
+
+        These are the only movements meant to read as quick, and even they
+        stay inside the motion envelope: GestureMove starts and ends at rest
+        on the pose it began from, so the chassis never takes an impulse.
+        """
+        from reachy_mini_openclaw.moves import GestureMove, move_start_state
+
+        mm = getattr(self.deps, "movement_manager", None)
+        if mm is None:
+            return
+        try:
+            start_pose, start_antennas = move_start_state(mm)
+            mm.queue_move(
+                GestureMove(
+                    gesture=gesture,
+                    start_pose=start_pose,
+                    start_antennas=start_antennas,
+                )
+            )
+        except Exception as e:
+            logger.debug("Gesture %s skipped: %s", gesture, e)
 
     def _robot_audio_playing(self) -> bool:
         """Best-effort: is robot speech currently audible from the speaker?"""
