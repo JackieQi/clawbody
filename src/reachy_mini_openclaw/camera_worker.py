@@ -70,7 +70,7 @@ class CameraWorker:
         self.interpolation_start_time: Optional[float] = None
         self.interpolation_start_pose: Optional[NDArray[np.float32]] = None
         self.face_lost_delay = 2.0  # seconds to wait before starting interpolation
-        self.interpolation_duration = 1.0  # seconds to interpolate back to neutral
+        self.interpolation_duration = 1.5  # seconds to interpolate back to neutral
 
         # Track state changes
         self.previous_head_tracking_state = self.is_head_tracking_enabled
@@ -89,9 +89,17 @@ class CameraWorker:
         # converges proportionally to the error, so a detection jump
         # (reacquisition, a face popping up across the frame) would
         # otherwise whip the head at several hundred deg/s -- hard enough
-        # to rock the base and risk toppling the robot.
+        # to rock the base and risk toppling the robot. 60 deg/s still
+        # crosses the full head range in under two seconds, which reads as
+        # attentive rather than startled.
         self.tracking_max_speed = float(
-            os.getenv("CLAWBODY_TRACK_MAX_SPEED", "90") or 90
+            os.getenv("CLAWBODY_TRACK_MAX_SPEED", "60") or 60
+        )
+        # Same cap for the translation part of the look-at pose (m/s): the
+        # head shifting bodily is just as capable of rocking the base as
+        # the head rotating.
+        self.tracking_max_lin_speed = float(
+            os.getenv("CLAWBODY_TRACK_MAX_LIN_SPEED", "0.06") or 0.06
         )
         self._last_track_update_time: Optional[float] = None
         
@@ -217,10 +225,12 @@ class CameraWorker:
         and the face detector gets a chance to catch faces at the edges.
         """
         t = current_time - self._scanning_start_time
-        
+
         yaw = float(self._scan_yaw_amplitude * np.sin(2 * np.pi * t / self._scan_period))
-        pitch = float(self._scan_pitch_offset)
-        
+        # Fade the tilt in rather than applying it the instant scanning
+        # starts -- a step, however small, is still a step
+        pitch = float(self._scan_pitch_offset * min(1.0, t / 0.6))
+
         with self.face_tracking_lock:
             self.face_tracking_offsets = [0.0, 0.0, 0.0, 0.0, pitch, yaw]
 
@@ -362,17 +372,21 @@ class CameraWorker:
             ]
             self._smoothed_offsets = smoothed
 
-            # Rate-limit the published rotations so no single tracking
-            # update can swing the head faster than tracking_max_speed
+            # Rate-limit the published offsets so no single tracking update
+            # can swing the head faster than the caps above
             if self._last_track_update_time is None:
                 dt = 0.04
             else:
                 dt = min(max(current_time - self._last_track_update_time, 0.02), 0.2)
             self._last_track_update_time = current_time
-            max_step = np.deg2rad(self.tracking_max_speed) * dt
-            prev = self.face_tracking_offsets
+            max_rot_step = np.deg2rad(self.tracking_max_speed) * dt
+            max_lin_step = self.tracking_max_lin_speed * dt
+
+            with self.face_tracking_lock:
+                prev = list(self.face_tracking_offsets)
             limited = list(smoothed)
-            for i in range(3, 6):
+            for i in range(6):
+                max_step = max_lin_step if i < 3 else max_rot_step
                 delta = float(np.clip(smoothed[i] - prev[i], -max_step, max_step))
                 limited[i] = prev[i] + delta
 
@@ -429,6 +443,11 @@ class CameraWorker:
             # Calculate interpolation progress (t from 0 to 1)
             elapsed_interpolation = current_time - self.interpolation_start_time
             t = min(1.0, elapsed_interpolation / self.interpolation_duration)
+
+            # Ease in/out: a linear ramp starts and stops at full speed, and
+            # from a wide tracking angle that step in velocity is a visible
+            # lurch. Smoothstep leaves and arrives at rest.
+            t = t * t * (3.0 - 2.0 * t)
 
             # Interpolate between current pose and neutral pose
             interpolated_pose = linear_pose_interpolation(

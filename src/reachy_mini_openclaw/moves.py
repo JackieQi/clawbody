@@ -44,19 +44,33 @@ def _env_flag(name: str, default: str = "on") -> bool:
     return os.getenv(name, default).strip().lower() not in ("off", "0", "false", "no")
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        raw = os.getenv(name)
+        return float(raw) if raw not in (None, "") else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 # Body-follow face tracking (wireless base): when the head must yaw far to
 # keep a tracked face in view, the base rotates underneath it so tracking
-# continues past the head's range (the base yaw is continuous 360°). When
-# the face is lost and the head-only scan comes up empty, the base joins
-# the search by slowly turning toward where the face was last seen.
+# continues past the head's range. When the face is lost and the head-only
+# scan comes up empty, the base joins the search by slowly turning toward
+# where the face was last seen.
+#
+# The base carries the whole robot, so it is driven as a *velocity* command
+# through the same acceleration limiter as everything else: a base that
+# snaps into motion throws the head sideways and rocks the chassis. Gains
+# are deliberately unhurried -- the loop closes through the camera, which
+# adds a few hundred ms of lag, and a hot gain on a laggy loop hunts.
 BODY_FOLLOW_ENABLED = _env_flag("CLAWBODY_BODY_FOLLOW")
 # Head yaw (degrees) that engages the base; hysteresis releases it near center
-BODY_FOLLOW_START_DEG = float(os.getenv("CLAWBODY_BODY_FOLLOW_START", "12") or 12)
-BODY_FOLLOW_STOP_DEG = 3.0
+BODY_FOLLOW_START_DEG = _env_float("CLAWBODY_BODY_FOLLOW_START", 18.0)
+BODY_FOLLOW_STOP_DEG = 6.0
 # Proportional gain (rad/s of base speed per rad of head yaw) and speed cap
-BODY_FOLLOW_GAIN = float(os.getenv("CLAWBODY_BODY_FOLLOW_GAIN", "2.5") or 2.5)
+BODY_FOLLOW_GAIN = _env_float("CLAWBODY_BODY_FOLLOW_GAIN", 1.1)
 BODY_FOLLOW_MAX_SPEED = float(np.deg2rad(
-    float(os.getenv("CLAWBODY_BODY_FOLLOW_MAX_SPEED", "60") or 60)))
+    _env_float("CLAWBODY_BODY_FOLLOW_MAX_SPEED", 30.0)))
 BODY_SEARCH_ENABLED = _env_flag("CLAWBODY_BODY_SEARCH")
 BODY_SEARCH_DELAY = 3.0  # seconds of head-only scanning before the base joins
 BODY_SEARCH_SPEED = float(np.deg2rad(20.0))
@@ -88,9 +102,158 @@ HEAD_Z_MIN, HEAD_Z_MAX = -0.020, 0.025  # metres
 # gaze); the body search unwinds the long way around to cross the seam.
 BODY_YAW_RANGE = float(np.deg2rad(150.0))
 
+# --- Motion envelope ------------------------------------------------------
+# Everything the robot does funnels through one 100Hz set_target, and the
+# daemon servos to whatever pose it is handed as fast as the motors allow.
+# A *step* in that pose is therefore a full-torque impulse: the head is the
+# heaviest thing on the robot and it sits on top, so an impulse rocks the
+# base and can tip the robot over. Bounding velocity alone is not enough --
+# going from 0 to the speed cap in one tick is still an impulse -- so the
+# final command is passed through a velocity- AND acceleration-limited
+# follower. These are a safety envelope, sized so well-behaved motion never
+# touches them; they exist to catch the pathological cases (a detection
+# jump, a macro reversal, the daemon handing control back mid-pose).
+HEAD_MAX_SPEED = float(np.deg2rad(_env_float("CLAWBODY_HEAD_MAX_SPEED", 140.0)))
+HEAD_MAX_ACCEL = float(np.deg2rad(_env_float("CLAWBODY_HEAD_MAX_ACCEL", 900.0)))
+HEAD_MAX_LIN_SPEED = _env_float("CLAWBODY_HEAD_MAX_LIN_SPEED", 0.12)  # m/s
+HEAD_MAX_LIN_ACCEL = _env_float("CLAWBODY_HEAD_MAX_LIN_ACCEL", 0.9)  # m/s^2
+# Base slew: the whole robot rotates, so it is the most tip-prone axis
+BODY_YAW_MAX_SPEED = float(np.deg2rad(_env_float("CLAWBODY_BODY_MAX_SPEED", 70.0)))
+BODY_YAW_MAX_ACCEL = float(np.deg2rad(_env_float("CLAWBODY_BODY_MAX_ACCEL", 110.0)))
+
+# The daemon refuses set_target while it plays a recorded move of its own
+# (emotions/dances go through its player), so when it hands control back
+# the real head can be far from where this loop thinks it is. Commanding
+# that difference in one tick is exactly the snap the limiter exists to
+# prevent, so re-seed the limiter from the measured pose instead.
+RESYNC_TOLERANCE = float(np.deg2rad(_env_float("CLAWBODY_RESYNC_DEG", 20.0)))
+RESYNC_HOLD = 0.3  # seconds of sustained divergence before re-seeding
+RESYNC_POLL = 0.1  # seconds between measured-pose reads
+
+# Global scale on the expressive gestures (nod/shake/bounce/sway)
+GESTURE_SCALE = float(np.clip(_env_float("CLAWBODY_GESTURE_SCALE", 1.0), 0.2, 1.5))
+
 # Type definitions
 FullBodyPose = Tuple[NDArray[np.float32], Tuple[float, float], float]
 SpeechOffsets = Tuple[float, float, float, float, float, float]
+
+
+def _wrap_angles(values: NDArray) -> NDArray:
+    """Wrap angles to (-pi, pi] elementwise."""
+    return (values + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def _approach_speed(error: Any, v_max: float, a_max: float, dt: float) -> NDArray:
+    """Fastest speed that still decelerates to a stop exactly on target.
+
+    The textbook answer, `sqrt(2*a*e)`, is the continuous-time one: braking
+    from it in discrete ticks travels an extra `v*dt/2`, so a follower using
+    it arrives with velocity left over and slams into whatever it was
+    approaching. Inverting the discrete braking distance
+    `e = v^2/(2a) + v*dt/2` instead gives the form below.
+
+    Near zero that form still asks for about `2e/dt` -- enough to overshoot
+    on the final tick -- so it is capped by the speed that nulls the error
+    in exactly one tick. The two cross over smoothly, leaving a profile
+    that is monotone in `e`, finite-sloped at the origin (no buzzing
+    against the acceleration limit once settled) and never overshoots.
+    """
+    error = np.asarray(error, dtype=float)
+    magnitude = np.abs(error)
+    half_tick = 0.5 * a_max * dt
+    braked = np.sqrt(half_tick * half_tick + 2.0 * a_max * magnitude) - half_tick
+    speed = np.sign(error) * np.minimum(magnitude / dt, braked)
+    return np.clip(speed, -v_max, v_max)
+
+
+class MotionLimiter:
+    """Velocity- and acceleration-limited follower for a vector signal.
+
+    Tracks a smooth input almost transparently -- the input's own velocity
+    is fed forward, so in steady state the output is the input delayed by
+    about one tick -- while any step or whip in the input is served at
+    bounded speed and bounded acceleration.
+
+    The catch-up term is the fastest approach speed that can still stop
+    exactly on target (`sqrt(2*a*err)`), so recovering from a step never
+    overshoots into an oscillation.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        v_max: float,
+        a_max: float,
+        dt: float,
+        wrap: bool = False,
+        ff_tau: float = 0.05,
+    ) -> None:
+        """Initialize the follower.
+
+        Args:
+            size: Number of independent axes
+            v_max: Speed limit (units/s)
+            a_max: Acceleration limit (units/s^2)
+            dt: Control period in seconds
+            wrap: Treat values as angles and use shortest-arc differences
+            ff_tau: Smoothing constant for the input-velocity feed-forward.
+                Long enough to turn a slower producer's staircase (the
+                camera worker publishes at 25Hz into a 100Hz loop) into a
+                ramp, short enough not to lag real motion.
+        """
+        self.pos = np.zeros(size, dtype=float)
+        self.vel = np.zeros(size, dtype=float)
+        self.v_max = float(v_max)
+        self.a_max = float(a_max)
+        self.dt = float(dt)
+        self.wrap = bool(wrap)
+        self._ff = np.zeros(size, dtype=float)
+        self._ff_alpha = float(min(1.0, dt / max(ff_tau, dt)))
+        self._prev_target: Optional[NDArray] = None
+
+    def reset(self, pos: Any) -> None:
+        """Re-seed the follower at `pos`, at rest."""
+        self.pos = np.asarray(pos, dtype=float).copy()
+        self.vel[:] = 0.0
+        self._ff[:] = 0.0
+        self._prev_target = self.pos.copy()
+
+    def step(self, target: Any) -> NDArray:
+        """Advance one tick toward `target` and return the limited output."""
+        target = np.asarray(target, dtype=float)
+        if self._prev_target is None:
+            self.reset(target)
+            return self.pos.copy()
+
+        # Feed forward how fast the target itself is moving
+        moved = target - self._prev_target
+        if self.wrap:
+            moved = _wrap_angles(moved)
+        self._prev_target = target.copy()
+        self._ff += self._ff_alpha * (moved / self.dt - self._ff)
+
+        error = target - self.pos
+        if self.wrap:
+            error = _wrap_angles(error)
+        catch_up = _approach_speed(error, self.v_max, self.a_max, self.dt)
+
+        desired = np.clip(self._ff + catch_up, -self.v_max, self.v_max)
+        max_dv = self.a_max * self.dt
+        self.vel += np.clip(desired - self.vel, -max_dv, max_dv)
+        self.pos = self.pos + self.vel * self.dt
+        return self.pos.copy()
+
+    def clamp_pos(self, low: Any, high: Any) -> None:
+        """Clip the follower's position, zeroing velocity on clipped axes."""
+        clamped = np.clip(self.pos, low, high)
+        stopped = clamped != self.pos
+        if np.any(stopped):
+            self.pos = clamped
+            self.vel[stopped] = 0.0
+
+    def at_rest(self, tolerance: float) -> bool:
+        """True while the output is barely moving."""
+        return bool(np.max(np.abs(self.vel)) < tolerance)
 
 
 class BreathingMove(Move):
@@ -195,9 +358,8 @@ class HeadLookMove(Move):
                 sound-source (DoA) orientation.
         """
         self.direction = direction
-        self.start_pose = start_pose
+        self.start_pose = np.asarray(start_pose, dtype=float)
         self.start_antennas = np.array(start_antennas)
-        self._duration = duration
         self.target_yaw_deg = target_yaw_deg
 
         if target_yaw_deg is not None:
@@ -214,11 +376,43 @@ class HeadLookMove(Move):
                 degrees=True, mm=True
             )
         self.target_antennas = np.array([0.0, 0.0])
-        
+        # Callers ask for a duration by feel; how violent that is depends on
+        # how far the head actually has to travel, which only this object
+        # knows. Stretch anything that would breach the motion envelope so
+        # no caller can whip the head by passing an eager number.
+        self._duration = max(float(duration), self._minimum_duration())
+
+    def _minimum_duration(self) -> float:
+        """Shortest duration whose eased profile stays inside the envelope.
+
+        Smoothstep peaks at 1.5*delta/T in speed and 6*delta/T^2 in
+        acceleration; invert both for the travel this move covers.
+        """
+        swing = float(
+            (
+                R.from_matrix(self.target_pose[:3, :3])
+                * R.from_matrix(self.start_pose[:3, :3]).inv()
+            ).magnitude()
+        )
+        shift = float(np.linalg.norm(self.target_pose[:3, 3] - self.start_pose[:3, 3]))
+
+        limits = [
+            (swing, HEAD_MAX_SPEED, HEAD_MAX_ACCEL),
+            (shift, HEAD_MAX_LIN_SPEED, HEAD_MAX_LIN_ACCEL),
+        ]
+        return max(
+            [0.0]
+            + [
+                max(1.5 * delta / v_max, float(np.sqrt(6.0 * delta / a_max)))
+                for delta, v_max, a_max in limits
+                if delta > 0.0
+            ]
+        )
+
     @property
     def duration(self) -> float:
         return self._duration
-        
+
     def evaluate(self, t: float) -> tuple:
         """Evaluate pose at time t."""
         alpha = min(1.0, t / self._duration)
@@ -233,6 +427,81 @@ class HeadLookMove(Move):
         antennas = (1 - alpha) * self.start_antennas + alpha * self.target_antennas
         
         return (head_pose, antennas.astype(np.float64), 0.0)
+
+
+class GestureMove(Move):
+    """Nod / head-shake / bounce as a windowed oscillation about a held pose.
+
+    These used to be chains of discrete look moves -- a 30 deg reversal
+    every 0.22 s, several hundred deg/s of head swing, which is exactly the
+    impulse that rocks the base. A windowed sinusoid reads the same
+    ("yes" / "no") but has continuous velocity: it starts and ends at rest
+    on the pose it began from, so no other stage has to absorb a step.
+
+    Face tracking keeps running underneath -- these are primary moves and
+    tracking is an additive secondary offset -- so the robot nods *at* the
+    person it is looking at instead of nodding at where they used to be.
+    """
+
+    # axis -> (create_head_pose keyword, amplitude, frequency Hz, cycles).
+    # A windowed sinusoid peaks at A*(2*pi*f)^2 in acceleration; these are
+    # picked to land around 85-90% of HEAD_MAX_ACCEL, so nodding and
+    # disagreeing stay the quickest things the robot does while still
+    # having headroom rather than riding the limiter.
+    PATTERNS: Dict[str, Tuple[str, float, float, float]] = {
+        "nod": ("pitch", float(np.deg2rad(9.5)), 1.45, 2.0),
+        "shake": ("yaw", float(np.deg2rad(11.0)), 1.35, 2.0),
+        "bounce": ("z", 0.007, 1.55, 2.0),
+        "sway": ("roll", float(np.deg2rad(8.0)), 1.1, 2.0),
+    }
+
+    def __init__(
+        self,
+        gesture: str,
+        start_pose: NDArray[np.float32],
+        start_antennas: Tuple[float, float],
+        scale: float = GESTURE_SCALE,
+    ):
+        """Initialize a gesture.
+
+        Args:
+            gesture: One of 'nod', 'shake', 'bounce', 'sway'
+            start_pose: Body-relative pose to oscillate about (and return to)
+            start_antennas: Antenna positions to hold
+            scale: Amplitude multiplier (CLAWBODY_GESTURE_SCALE by default)
+        """
+        axis, amplitude, frequency, cycles = self.PATTERNS.get(
+            gesture, self.PATTERNS["nod"]
+        )
+        self.gesture = gesture
+        self.axis = axis
+        self.amplitude = amplitude * float(np.clip(scale, 0.2, 1.5))
+        self.frequency = frequency
+        self._duration = cycles / frequency
+        self.start_pose = np.asarray(start_pose, dtype=float).copy()
+        self.start_antennas = np.array(start_antennas, dtype=np.float64)
+        # Named like HeadLookMove so queued sequences can chain off a gesture
+        self.target_pose = self.start_pose
+        self.target_antennas = self.start_antennas
+
+    @property
+    def duration(self) -> float:
+        return self._duration
+
+    def evaluate(self, t: float) -> tuple:
+        """Evaluate the gesture at time t."""
+        t = float(np.clip(t, 0.0, self._duration))
+        # Half-sine window: value AND velocity are zero at both ends, so the
+        # gesture blends into and out of the held pose without a kick
+        window = np.sin(np.pi * t / self._duration)
+        value = self.amplitude * window * np.sin(2 * np.pi * self.frequency * t)
+
+        components = {"x": 0.0, "y": 0.0, "z": 0.0, "roll": 0.0, "pitch": 0.0, "yaw": 0.0}
+        components[self.axis] = float(value)
+        offset = create_head_pose(degrees=False, mm=False, **components)
+
+        pose = compose_world_offset(self.start_pose, offset, reorthonormalize=True)
+        return (pose, self.start_antennas, 0.0)
 
 
 def combine_full_body(primary: FullBodyPose, secondary: FullBodyPose) -> FullBodyPose:
@@ -254,6 +523,28 @@ def clone_pose(pose: FullBodyPose) -> FullBodyPose:
     """Deep copy a full body pose."""
     head, ant, yaw = pose
     return (head.copy(), (float(ant[0]), float(ant[1])), float(yaw))
+
+
+def move_start_state(movement_manager: Any) -> Tuple[NDArray, Tuple[float, float]]:
+    """Pose and antennas a newly queued move should start from.
+
+    Always ask the manager, never `robot.get_current_head_pose()`. The
+    measured pose is world-frame: it already contains the base yaw and
+    every secondary offset (face tracking, speech wobble, thinking sway).
+    Feeding it back in as a *primary* pose made the loop add both a second
+    time, so the commanded pose jumped by the whole tracking offset plus
+    the whole base angle in a single 10 ms tick -- the snap that rocks the
+    chassis. The manager's primary pose is body-relative and composes
+    cleanly.
+    """
+    getter = getattr(movement_manager, "get_primary_pose", None)
+    if getter is not None:
+        try:
+            head, antennas, _ = getter()
+            return head, antennas
+        except Exception as e:
+            logger.debug("Falling back to neutral move start pose: %s", e)
+    return create_head_pose(0, 0, 0, 0, 0, 0, degrees=True), (0.0, 0.0)
 
 
 @dataclass
@@ -350,14 +641,30 @@ class MovementManager:
         self._thinking_antenna_offsets: Tuple[float, float] = (0.0, 0.0)
 
         # Persistent base body yaw (radians): slewed toward its target each
-        # tick and added to every command, so the base can rotate (up to a
-        # full 360°) while head moves/offsets compose on top
+        # tick and added to every command, so the base can rotate while head
+        # moves/offsets compose on top. Driven either by an absolute target
+        # (turn_body / body_sway) or by a velocity command (body-follow);
+        # either way the slew is speed- and acceleration-limited.
         self._body_yaw_current = 0.0
         self._body_yaw_target = 0.0
-        self.body_yaw_rate = float(np.deg2rad(120.0))  # max slew speed, rad/s
+        self._body_yaw_vel = 0.0
+        self._body_yaw_vel_cmd: Optional[float] = None
+        self.body_yaw_rate = BODY_YAW_MAX_SPEED  # max slew speed, rad/s
+        self.body_yaw_accel = BODY_YAW_MAX_ACCEL  # rad/s^2
         # Hard range of the base motor; None only for tests
         self.body_yaw_limit: Optional[float] = BODY_YAW_RANGE
         self._last_cmd_error_log = float("-inf")
+
+        # Final output smoothing: nothing reaches the robot without passing
+        # through these, whatever upstream does
+        self._head_rot_limiter = MotionLimiter(
+            3, HEAD_MAX_SPEED, HEAD_MAX_ACCEL, self.target_period, wrap=True
+        )
+        self._head_pos_limiter = MotionLimiter(
+            3, HEAD_MAX_LIN_SPEED, HEAD_MAX_LIN_ACCEL, self.target_period
+        )
+        self._last_resync_poll = float("-inf")
+        self._diverged_since: Optional[float] = None
 
         # Body-follow face tracking state
         self._body_follow_active = False
@@ -371,6 +678,7 @@ class MovementManager:
         self._shared_last_activity = self.state.last_activity_time
         self._shared_is_listening = False
         self._shared_body_yaw = (0.0, 0.0)  # (current, target)
+        self._shared_primary_pose = clone_pose(self.state.last_primary_pose)
         self._base_active_until = float("-inf")
         self._shared_base_active_until = float("-inf")
         
@@ -417,6 +725,15 @@ class MovementManager:
         """Get (current, target) base body yaw in radians. Thread-safe."""
         with self._shared_lock:
             return self._shared_body_yaw
+
+    def get_primary_pose(self) -> FullBodyPose:
+        """Body-relative primary pose the loop is holding. Thread-safe.
+
+        This -- not the robot's measured head pose -- is what a newly
+        queued move must start from; see `move_start_state`.
+        """
+        with self._shared_lock:
+            return clone_pose(self._shared_primary_pose)
 
     def is_base_active(self) -> bool:
         """True while the base motor is slewing (or just stopped). Thread-safe.
@@ -472,6 +789,9 @@ class MovementManager:
         full turn. Explicit yaw commands (turn_body/body_sway) and
         choreographed moves take precedence.
         """
+        # Any tick that does not explicitly ask the base to turn releases it
+        self._body_yaw_vel_cmd = None
+
         cw = self.camera_worker
         if cw is None or not (BODY_FOLLOW_ENABLED or BODY_SEARCH_ENABLED):
             return
@@ -503,14 +823,14 @@ class MovementManager:
             elif abs(yaw_off) < np.deg2rad(BODY_FOLLOW_STOP_DEG):
                 self._body_follow_active = False
                 return
-            speed = float(np.clip(
+            # Velocity command, not a position target: _advance_body_yaw
+            # ramps into and out of it under the acceleration limit, so the
+            # base eases into the turn instead of jerking the chassis
+            self._body_yaw_vel_cmd = float(np.clip(
                 BODY_FOLLOW_GAIN * yaw_off,
                 -BODY_FOLLOW_MAX_SPEED,
                 BODY_FOLLOW_MAX_SPEED,
             ))
-            # Keep the target glued just ahead of current so the slew in
-            # _advance_body_yaw moves at exactly this speed with no windup
-            self._body_yaw_target = self._body_yaw_current + speed * self.target_period
             return
 
         self._body_follow_active = False
@@ -548,7 +868,7 @@ class MovementManager:
                     "left" if self._last_face_side > 0 else "right",
                 )
         self._search_turned += step
-        self._body_yaw_target = self._body_yaw_current + self._last_face_side * step
+        self._body_yaw_vel_cmd = self._last_face_side * BODY_SEARCH_SPEED
 
     def _update_thinking_offsets(self, current_time: float) -> None:
         """Compute thinking animation as secondary offsets.
@@ -637,11 +957,13 @@ class MovementManager:
         elif cmd == "set_body_yaw":
             yaw, relative = payload
             self._body_yaw_target = (self._body_yaw_target + yaw) if relative else yaw
+            self._body_yaw_vel_cmd = None  # explicit target wins over body-follow
             self._external_yaw_cmd_time = current_time
             self.state.update_activity()
             logger.info("Body yaw target: %.0f°", float(np.rad2deg(self._body_yaw_target)))
         elif cmd == "halt_body_yaw":
             self._body_yaw_target = self._body_yaw_current
+            self._body_yaw_vel_cmd = None
             self._external_yaw_cmd_time = current_time
                 
     def _manage_move_queue(self, current_time: float) -> None:
@@ -672,12 +994,17 @@ class MovementManager:
             idle_for = current_time - self.state.last_activity_time
             if idle_for >= self.idle_inactivity_delay:
                 try:
-                    _, current_ant = self.current_robot.get_current_joint_positions()
-                    current_head = self.current_robot.get_current_head_pose()
-                    
+                    # Start from the pose the loop is already holding, NOT
+                    # from the robot's measured pose. The measured pose is
+                    # world-frame and already includes the base yaw and the
+                    # face-tracking offset, both of which get composed on
+                    # again below -- and breathing restarts after every
+                    # move, so that double count fired constantly.
+                    start_head, start_antennas = move_start_state(self)
+
                     breathing = BreathingMove(
-                        interpolation_start_pose=current_head,
-                        interpolation_start_antennas=current_ant,
+                        interpolation_start_pose=start_head,
+                        interpolation_start_antennas=start_antennas,
                         interpolation_duration=1.0,
                     )
                     self.move_queue.append(breathing)
@@ -753,18 +1080,55 @@ class MovementManager:
         )
         
     def _advance_body_yaw(self) -> float:
-        """Slew the persistent base yaw toward its target; return current value."""
+        """Slew the persistent base yaw; return the current value.
+
+        Speed *and* acceleration limited. The base carries the entire robot,
+        so stepping straight to the speed cap throws the head sideways and
+        rocks the chassis; ramping in and out keeps the turn planted.
+        """
+        dt = self.target_period
+        accel = self.body_yaw_accel
+
         if self.body_yaw_limit is not None:
             self._body_yaw_target = float(np.clip(
                 self._body_yaw_target, -self.body_yaw_limit, self.body_yaw_limit
             ))
-        delta = self._body_yaw_target - self._body_yaw_current
-        max_step = self.body_yaw_rate * self.target_period
-        if abs(delta) <= max_step:
-            self._body_yaw_current = self._body_yaw_target
+
+        if self._body_yaw_vel_cmd is not None:
+            desired = float(np.clip(
+                self._body_yaw_vel_cmd, -self.body_yaw_rate, self.body_yaw_rate
+            ))
+            # Start braking before the hard stop rather than slamming into it
+            if self.body_yaw_limit is not None and desired * self._body_yaw_current > 0:
+                room = max(0.0, self.body_yaw_limit - abs(self._body_yaw_current))
+                stop_speed = float(np.sqrt(2.0 * accel * room))
+                desired = float(np.clip(desired, -stop_speed, stop_speed))
         else:
-            self._body_yaw_current += max_step if delta > 0 else -max_step
-        if delta != 0.0:
+            desired = float(_approach_speed(
+                self._body_yaw_target - self._body_yaw_current,
+                self.body_yaw_rate,
+                accel,
+                dt,
+            ))
+
+        max_dv = accel * dt
+        self._body_yaw_vel += float(np.clip(desired - self._body_yaw_vel, -max_dv, max_dv))
+        self._body_yaw_current += self._body_yaw_vel * dt
+
+        if self.body_yaw_limit is not None:
+            clamped = float(np.clip(
+                self._body_yaw_current, -self.body_yaw_limit, self.body_yaw_limit
+            ))
+            if clamped != self._body_yaw_current:
+                self._body_yaw_current = clamped
+                self._body_yaw_vel = 0.0
+
+        if self._body_yaw_vel_cmd is not None:
+            # Velocity mode owns the base: keep the position target with it
+            # so the "yield to explicit rotations" check can't self-trigger
+            self._body_yaw_target = self._body_yaw_current
+
+        if abs(self._body_yaw_vel) > 1e-4:
             # Motor noise lingers briefly after motion stops
             self._base_active_until = self._now() + 0.4
         return self._body_yaw_current
@@ -787,6 +1151,92 @@ class MovementManager:
             head[:3, :3] = R.from_euler("xyz", clamped).as_matrix()
         head[2, 3] = float(np.clip(head[2, 3], HEAD_Z_MIN, HEAD_Z_MAX))
         return head
+
+    def _smooth_head_pose(self, head: NDArray, current_time: float) -> NDArray:
+        """Serve the composed pose under the speed/acceleration envelope.
+
+        Upstream stages are individually smooth but their *transitions* are
+        not: a move starting, a face being reacquired across the frame, the
+        scan sweep handing over to tracking. Each of those is a step, and a
+        step at 100Hz is a full-torque impulse into the chassis. Everything
+        leaves through here so none of them can reach the motors as one.
+        """
+        euler = R.from_matrix(head[:3, :3]).as_euler("xyz")
+        translation = np.asarray(head[:3, 3], dtype=float)
+
+        self._resync_after_external_move(current_time)
+
+        rotation = self._head_rot_limiter.step(euler)
+        self._head_rot_limiter.clamp_pos(
+            [-HEAD_ROLL_LIMIT, HEAD_PITCH_UP_LIMIT, -NECK_YAW_LIMIT],
+            [HEAD_ROLL_LIMIT, HEAD_PITCH_DOWN_LIMIT, NECK_YAW_LIMIT],
+        )
+        rotation = self._head_rot_limiter.pos
+        position = self._head_pos_limiter.step(translation)
+
+        smoothed = np.eye(4)
+        smoothed[:3, :3] = R.from_euler("xyz", rotation).as_matrix()
+        smoothed[:3, 3] = position
+        return smoothed
+
+    def _resync_after_external_move(self, current_time: float) -> None:
+        """Re-seed the smoother when something else has moved the robot.
+
+        The daemon ignores our set_target while it plays a recorded move of
+        its own (that is how the emotion/dance tools work), so control comes
+        back with the head somewhere we never commanded. Left alone, the
+        next tick would command the whole difference at once. Checked only
+        while our own output is at rest, so ordinary servo lag during a
+        commanded move can never be mistaken for a takeover.
+        """
+        if RESYNC_TOLERANCE <= 0 or current_time - self._last_resync_poll < RESYNC_POLL:
+            return
+        self._last_resync_poll = current_time
+
+        if not (
+            self._head_rot_limiter.at_rest(np.deg2rad(20.0))
+            and abs(self._body_yaw_vel) < np.deg2rad(10.0)
+        ):
+            self._diverged_since = None
+            return
+
+        try:
+            joints, _ = self.current_robot.get_current_joint_positions()
+            measured = np.asarray(
+                self.current_robot.get_current_head_pose(), dtype=float
+            )
+        except Exception as e:
+            logger.debug("Pose resync read failed: %s", e)
+            return
+
+        # The measured pose is world-frame (FK over all seven joints);
+        # undo the base yaw to compare it with our body-relative command
+        base_yaw = float(joints[0])
+        relative = self._rotate_head_by_base_yaw(measured, -base_yaw)
+        measured_euler = R.from_matrix(relative[:3, :3]).as_euler("xyz")
+        drift = float(np.max(np.abs(
+            _wrap_angles(measured_euler - self._head_rot_limiter.pos)
+        )))
+
+        if drift < RESYNC_TOLERANCE:
+            self._diverged_since = None
+            return
+        if self._diverged_since is None:
+            self._diverged_since = current_time
+            return
+        if current_time - self._diverged_since < RESYNC_HOLD:
+            return
+
+        self._diverged_since = None
+        logger.info(
+            "Head %.0f° from commanded pose (external move?); easing back in",
+            float(np.rad2deg(drift)),
+        )
+        self._head_rot_limiter.reset(measured_euler)
+        self._head_pos_limiter.reset(relative[:3, 3])
+        self._body_yaw_current = base_yaw
+        self._body_yaw_target = base_yaw
+        self._body_yaw_vel = 0.0
 
     def _rotate_head_by_base_yaw(self, head: NDArray, base_yaw: float) -> NDArray:
         """Express the body-relative head pose in the daemon's world frame."""
@@ -818,6 +1268,8 @@ class MovementManager:
             self._shared_is_listening = self._is_listening
             self._shared_body_yaw = (self._body_yaw_current, self._body_yaw_target)
             self._shared_base_active_until = self._base_active_until
+            if self.state.last_primary_pose is not None:
+                self._shared_primary_pose = clone_pose(self.state.last_primary_pose)
             
     def start(self) -> None:
         """Start the control loop thread."""
@@ -883,10 +1335,12 @@ class MovementManager:
             
             # Compose the body-relative pose; moves carry transient yaw, the
             # persistent base yaw (turn_body/body_sway/body-follow) is added
-            # on top. Clamp the neck twist so IK stays solvable, then express
-            # the head in the world frame the daemon expects.
+            # on top. Clamp the neck twist so IK stays solvable, hold the
+            # result inside the motion envelope, then express the head in
+            # the world frame the daemon expects.
             head, antennas, body_yaw = self._compose_pose(loop_start)
             head = self._clamp_head_pose(head)
+            head = self._smooth_head_pose(head, loop_start)
             base_yaw = self._advance_body_yaw()
             head = self._rotate_head_by_base_yaw(head, base_yaw)
             body_yaw += base_yaw

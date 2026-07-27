@@ -339,19 +339,19 @@ async def dispatch_tool_call(
 
 async def _handle_look(args: dict, deps: ToolDependencies) -> dict:
     """Handle the look tool."""
-    from reachy_mini_openclaw.moves import HeadLookMove
-    
+    from reachy_mini_openclaw.moves import HeadLookMove, move_start_state
+
     direction = args.get("direction", "front")
-    
+
     try:
-        # Get current pose for smooth transition
-        _, current_ant = deps.robot.get_current_joint_positions()
-        current_head = deps.robot.get_current_head_pose()
-        
+        # Start from the pose the movement loop is holding (body-relative),
+        # never the robot's measured world-frame pose -- see move_start_state
+        start_pose, start_antennas = move_start_state(deps.movement_manager)
+
         move = HeadLookMove(
             direction=direction,
-            start_pose=current_head,
-            start_antennas=tuple(current_ant),
+            start_pose=start_pose,
+            start_antennas=start_antennas,
             duration=1.0,
         )
         deps.movement_manager.queue_move(move)
@@ -510,7 +510,7 @@ async def _handle_emotion(args: dict, deps: ToolDependencies) -> dict:
     emotions library, e.g. sad2/oops1/success1) when the daemon is running,
     falling back to simple head-movement macros otherwise.
     """
-    from reachy_mini_openclaw.moves import HeadLookMove
+    from reachy_mini_openclaw.moves import GestureMove, HeadLookMove, move_start_state
 
     emotion_name = args.get("emotion_name", "happy")
 
@@ -530,7 +530,12 @@ async def _handle_emotion(args: dict, deps: ToolDependencies) -> dict:
     except Exception:
         pass
 
-    # Map emotions to simple head movements (macro fallback)
+    # Repeating gestures are oscillations, not chains of look moves: a
+    # reversal every fraction of a second is a whip that rocks the base.
+    # GestureMove gives the same read with continuous velocity.
+    gesture_names = {"nod", "shake", "bounce", "sway", "wave"}
+
+    # Map the remaining emotions to simple head movements (macro fallback)
     emotion_sequences: dict[str, list[str]] = {
         "happy": ["up", "front"],
         "sad": ["down"],
@@ -538,37 +543,46 @@ async def _handle_emotion(args: dict, deps: ToolDependencies) -> dict:
         "curious": ["right", "left", "front"],
         "thinking": ["up", "left"],
         "confused": ["left", "right", "front"],
-        "excited": ["up", "down", "up", "front"],
-        # Common aliases / gestures (exaggerated by repetition + snappier timing)
-        "wave": ["right", "left", "right", "front"],
-        "nod": ["down", "up", "down", "up", "front"],
-        "shake": ["left", "right", "left", "right", "left", "front"],
-        "bounce": ["down", "up", "down", "front"],
+        "excited": ["up", "front"],
     }
 
-    sequence = emotion_sequences.get(emotion_name, ["front"])
-
     try:
+        start_pose, start_antennas = move_start_state(deps.movement_manager)
+
+        if emotion_name in gesture_names:
+            gesture = "shake" if emotion_name == "wave" else emotion_name
+            deps.movement_manager.queue_move(
+                GestureMove(
+                    gesture=gesture,
+                    start_pose=start_pose,
+                    start_antennas=start_antennas,
+                )
+            )
+            return {
+                "status": "success",
+                "emotion": emotion_name,
+                "source": "macro",
+                "known": True,
+            }
+
+        sequence = emotion_sequences.get(emotion_name, ["front"])
+
         # Chain each move's start pose to the previous move's target so the
         # queued sequence stays continuous instead of snapping back to the
         # pose the robot had at queue time
         prev_move = None
         for direction in sequence:
-            if prev_move is None:
-                _, current_ant = deps.robot.get_current_joint_positions()
-                start_pose = deps.robot.get_current_head_pose()
-                start_antennas = tuple(current_ant)
-            else:
+            if prev_move is not None:
                 start_pose = prev_move.target_pose
                 start_antennas = tuple(prev_move.target_antennas)
 
-            # 0.45s per step: quick enough to read as expressive, slow
-            # enough that the yaw reversals don't rock the base
+            # 0.6s per step: expressive without asking the chassis to
+            # absorb a reversal it can't
             move = HeadLookMove(
                 direction=direction,
                 start_pose=start_pose,
                 start_antennas=start_antennas,
-                duration=0.45,
+                duration=0.6,
             )
             deps.movement_manager.queue_move(move)
             prev_move = move
@@ -599,6 +613,7 @@ async def _handle_capabilities(args: dict, deps: ToolDependencies) -> dict:
         "nod",
         "shake",
         "bounce",
+        "sway",
     ]
 
     # capabilities_report probes the daemon over HTTP; keep it off the event loop
