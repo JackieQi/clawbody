@@ -23,7 +23,7 @@ class Config:
     OPENAI_API_KEY: str = field(
         default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
     OPENAI_MODEL: str = field(default_factory=lambda: os.getenv(
-        "OPENAI_MODEL", "gpt-realtime-mini-2025-12-15"))
+        "OPENAI_MODEL", "gpt-realtime-2.1-mini"))
     OPENAI_VOICE: str = field(
         default_factory=lambda: os.getenv("OPENAI_VOICE", "cedar"))
     # Speech-to-text model for the Realtime session's input transcription
