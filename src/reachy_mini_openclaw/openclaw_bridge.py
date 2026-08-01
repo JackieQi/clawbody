@@ -7,6 +7,7 @@ ClawBody uses OpenAI Realtime API for voice I/O (speech recognition + TTS)
 but routes all responses through OpenClaw (Clawson) for intelligence.
 """
 
+import os
 import json
 import asyncio
 import base64
@@ -21,6 +22,7 @@ from dataclasses import dataclass
 import websockets
 
 from reachy_mini_openclaw.config import config
+from reachy_mini_openclaw.voice_gate import TurnDeduper, turn_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +199,31 @@ class OpenClawBridge:
         self._pending: dict[str, asyncio.Future] = {}
         # Events keyed by runId -> list of event payloads
         self._run_events: dict[str, asyncio.Queue] = {}
+
+        # Idempotency for conversation sync. The same captured turn was
+        # observed being re-sent verbatim thirteen minutes apart, which
+        # both wastes a backend run and corrupts the agent's memory with
+        # phantom repetition. Keyed on content, not time, because the
+        # duplicates were byte-identical.
+        self._sync_deduper = TurnDeduper(
+            capacity=128,
+            ttl_s=float(getattr(config, "SYNC_DEDUPE_TTL_S", 900.0) or 900.0),
+        )
+        self._sync_dedupe_enabled = bool(
+            getattr(config, "SYNC_DEDUPE_ENABLED", True)
+        )
+
+        # Agent context is fetched once per process, not once per WebSocket
+        # session. Reconnects are frequent (idle timeouts, network blips)
+        # and each one used to fire a fresh full-context handoff request at
+        # the backend -- eight in twenty minutes, observed. The cached copy
+        # is reused until it ages out.
+        self._agent_context_cache: Optional[str] = None
+        self._agent_context_at: float = 0.0
+        self._agent_context_ttl = float(
+            os.environ.get("CLAWBODY_CONTEXT_TTL_S", "3600") or 3600.0
+        )
+        self._agent_context_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # URL helpers
@@ -663,9 +690,31 @@ class OpenClawBridge:
         - Important memories about the user
         - Current state
 
+        Cached for CLAWBODY_CONTEXT_TTL_S (default 1h). Without the cache
+        this fires on every Realtime reconnect, and reconnects are common
+        enough that the backend was seeing the same full-context handoff
+        request eight times in twenty minutes. The lock makes concurrent
+        callers share one fetch rather than racing into several.
+
         Returns:
             A context string to use as system instructions, or None if failed
         """
+        async with self._agent_context_lock:
+            return await self._get_agent_context_locked()
+
+    async def _get_agent_context_locked(self) -> Optional[str]:
+        """Cache-checking body of `get_agent_context`; call under the lock."""
+        now = time.monotonic()
+        if self._agent_context_cache is not None and (
+            self._agent_context_ttl <= 0
+            or now - self._agent_context_at < self._agent_context_ttl
+        ):
+            logger.info(
+                "Reusing cached agent context (%d chars, %.0fs old)",
+                len(self._agent_context_cache), now - self._agent_context_at,
+            )
+            return self._agent_context_cache
+
         try:
             response = await self.chat(
                 message="Provide your current context summary for the robot body.",
@@ -691,6 +740,8 @@ class OpenClawBridge:
                     "Retrieved agent context from OpenClaw (%d chars)",
                     len(response.content),
                 )
+                self._agent_context_cache = response.content
+                self._agent_context_at = time.monotonic()
                 return response.content
 
             logger.warning("No context returned from OpenClaw")
@@ -700,15 +751,38 @@ class OpenClawBridge:
             logger.error("Failed to get agent context: %s", e)
             return None
 
+    def invalidate_agent_context(self) -> None:
+        """Force the next `get_agent_context` call to re-fetch.
+
+        For the case where the user has genuinely changed something in the
+        agent's memory and wants the robot to pick it up without a restart.
+        """
+        self._agent_context_cache = None
+        self._agent_context_at = 0.0
+
     async def sync_conversation(
         self, user_message: str, assistant_response: str
     ) -> None:
         """Sync a conversation turn back to OpenClaw for memory continuity.
 
+        Duplicate turns are dropped: the same (user, assistant) pair is
+        only ever forwarded once within the dedupe TTL. Set
+        CLAWBODY_SYNC_DEDUPE=false to restore the old resend-everything
+        behaviour.
+
         Args:
             user_message: What the user said
             assistant_response: What the robot/AI responded
         """
+        if self._sync_dedupe_enabled:
+            fingerprint = turn_fingerprint(user_message, assistant_response)
+            if self._sync_deduper.seen(fingerprint):
+                logger.info(
+                    "Skipping duplicate conversation sync (%s): %r",
+                    fingerprint[:8], (user_message or "")[:60],
+                )
+                return
+
         try:
             await self.chat(
                 message=(
