@@ -401,8 +401,9 @@ class GateSettings:
         enabled: Master switch. False makes the gate a pass-through.
         require_wake_word: Require the robot be addressed by name.
         wake_words: Accepted names and mistranscriptions.
-        grace_s: How long after an addressed turn follow-ups are accepted
-            without repeating the name. 0 means every turn needs the name.
+        grace_s: How long after the exchange goes quiet -- the robot has
+            finished its reply -- follow-ups are accepted without repeating
+            the name. 0 means every turn needs the name.
         allowed_languages: Language families forwarded to the model.
         min_chars: Minimum letters for a Latin transcript to be meaningful.
         suppress_acks: Drop pure acknowledgment noises.
@@ -416,7 +417,7 @@ class GateSettings:
     enabled: bool = True
     require_wake_word: bool = True
     wake_words: tuple[str, ...] = DEFAULT_WAKE_WORDS
-    grace_s: float = 30.0
+    grace_s: float = 150.0
     allowed_languages: tuple[str, ...] = ("en", "zh")
     min_chars: int = 2
     suppress_acks: bool = True
@@ -486,8 +487,19 @@ class VoiceGate:
     # -- grace window ----------------------------------------------------
 
     def _open_grace(self, now: Optional[float] = None) -> None:
+        self.refresh_grace(now)
+
+    def refresh_grace(self, now: Optional[float] = None, delay: float = 0.0) -> None:
+        """Restart the follow-up window: the conversation is still live.
+
+        `delay` postpones the start, for activity that is still in
+        progress. The robot's own reply is part of the exchange, so the
+        window has to begin when that reply *finishes* -- opening it when
+        the reply was merely generated spends most of it on the robot's
+        own talking, and the user is cut off partway through thinking.
+        """
         t = time.monotonic() if now is None else now
-        self._grace_until = t + max(0.0, self.settings.grace_s)
+        self._grace_until = t + max(0.0, delay) + max(0.0, self.settings.grace_s)
 
     def grace_open(self, now: Optional[float] = None) -> bool:
         """Is the conversational follow-up window still open?"""
@@ -597,7 +609,7 @@ def settings_from_config(cfg: object) -> GateSettings:
         enabled=bool(_get("VOICE_GATE_ENABLED", True)),
         require_wake_word=bool(_get("WAKE_WORD_REQUIRED", True)),
         wake_words=_csv("WAKE_WORDS", DEFAULT_WAKE_WORDS),
-        grace_s=float(_get("WAKE_GRACE_S", 30.0)),
+        grace_s=float(_get("WAKE_GRACE_S", 150.0)),
         allowed_languages=_csv("VOICE_LANGUAGES", ("en", "zh")),
         min_chars=int(_get("VOICE_MIN_CHARS", 2)),
         suppress_acks=bool(_get("SUPPRESS_ACKS", True)),

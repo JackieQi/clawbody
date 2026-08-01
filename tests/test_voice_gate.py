@@ -200,6 +200,49 @@ def test_grace_window_is_refreshed_by_each_accepted_turn() -> None:
     assert g.evaluate("and the news?", now=150.0).allow
 
 
+def test_grace_window_starts_when_the_reply_finishes() -> None:
+    """The window is for the pause after the robot stops, not before it starts.
+
+    Verbatim from 23:40:27 on 2026-08-01. The turn was accepted at 23:39:47,
+    the robot then spoke for ~17s, and the follow-up came 23s after it fell
+    silent -- squarely conversational -- but 40s after the turn was
+    accepted, so a window opened at acceptance had already lapsed.
+    """
+    g = _gate(grace_s=45.0)
+    assert g.evaluate("Kira, what audio players are there?", now=0.0).allow
+    # Reply generated at t=5 with 17s of audio still to play
+    g.refresh_grace(now=5.0, delay=17.0)
+    d = g.evaluate("I actually want to have an audio player.", now=40.0)
+    assert d.allow
+    assert d.reason == "grace_window"
+
+
+def test_long_reply_does_not_eat_the_window() -> None:
+    """A two-minute answer must not leave zero time to follow up."""
+    g = _gate(grace_s=45.0)
+    assert g.evaluate("Kira, explain that", now=0.0).allow
+    g.refresh_grace(now=2.0, delay=120.0)
+    # 10s after the speaker finally goes quiet
+    assert g.evaluate("why is that?", now=132.0).allow
+
+
+def test_grace_still_expires_after_a_real_pause() -> None:
+    """Walking away must still re-arm the name requirement."""
+    g = _gate(grace_s=45.0)
+    assert g.evaluate("Kira, hello", now=0.0).allow
+    g.refresh_grace(now=2.0, delay=8.0)  # quiet from t=10
+    d = g.evaluate("are you there?", now=200.0)
+    assert not d.allow
+    assert d.reason == "not_addressed"
+
+
+def test_refresh_grace_delay_is_not_negative() -> None:
+    g = _gate(grace_s=30.0)
+    g.refresh_grace(now=100.0, delay=-5.0)
+    assert g.grace_open(now=120.0)
+    assert not g.grace_open(now=131.0)
+
+
 def test_zero_grace_requires_the_name_every_turn() -> None:
     g = _gate(grace_s=0.0)
     assert g.evaluate("Kira, hello", now=100.0).allow

@@ -100,7 +100,7 @@ class Config:
     # Seconds after an addressed turn during which follow-ups don't need
     # the name again. 0 = say the name every time.
     WAKE_GRACE_S: float = field(default_factory=lambda: float(
-        os.getenv("CLAWBODY_WAKE_GRACE_S", "30") or 30.0))
+        os.getenv("CLAWBODY_WAKE_GRACE_S", "150") or 150.0))
     # Language families forwarded to the model; anything else is dropped
     # silently. "ja" is excluded on purpose (children in the room).
     VOICE_LANGUAGES: str = field(default_factory=lambda: os.getenv(

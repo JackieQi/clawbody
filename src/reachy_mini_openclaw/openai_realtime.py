@@ -593,8 +593,11 @@ OpenClaw has access to many capabilities you don't have directly.""",
             self._base_instructions = system_instructions
         system_instructions += self._time_line()
 
-        # The gate re-arms per session: a reconnect is a fresh room.
-        self._voice_gate.close_grace()
+        # A dropped socket is not a fresh room. Reconnects happen on their
+        # own schedule -- seven in one two-hour session -- and re-arming the
+        # wake word on each one silently ended conversations mid-flow, with
+        # nothing to tell the user why. An open window is left to expire on
+        # its own; after any outage longer than grace_s it already has.
         
         # GA Realtime API (the beta API shape was retired by OpenAI in May 2026)
         async with self.client.realtime.connect(model=model) as conn:
@@ -830,6 +833,13 @@ OpenClaw has access to many capabilities you don't have directly.""",
             if self.deps.head_wobbler is not None:
                 self.deps.head_wobbler.reset()
             logger.debug("Response completed")
+
+            # The follow-up window belongs to the pause *after* the robot
+            # stops talking, not to the moment its reply was generated.
+            # response.done fires when generation finishes, with seconds of
+            # audio still queued; start the window when that audio runs out,
+            # or the reply spends the window talking over it.
+            self._voice_gate.refresh_grace(delay=self._audio_remaining())
             
             # Sync conversation to OpenClaw for memory continuity
             await self._sync_to_openclaw()
@@ -1203,6 +1213,17 @@ OpenClaw has access to many capabilities you don't have directly.""",
             )
         except Exception as e:
             logger.debug("Gesture %s skipped: %s", gesture, e)
+
+    def _audio_remaining(self) -> float:
+        """Seconds of this response's audio still queued to play.
+
+        Generation finishes well before the speaker does, so this is what
+        separates "the reply is written" from "the room is quiet again".
+        """
+        if self._audio_play_start is None:
+            return 0.0
+        now = asyncio.get_event_loop().time()
+        return max(0.0, self._audio_play_start + self._audio_enqueued_s - now)
 
     def _robot_audio_playing(self) -> bool:
         """Best-effort: is robot speech currently audible from the speaker?"""
