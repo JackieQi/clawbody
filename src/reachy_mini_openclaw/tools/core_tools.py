@@ -124,6 +124,9 @@ class ToolDependencies:
     camera_worker: Optional[Any] = None
     openclaw_bridge: Optional["OpenClawBridge"] = None
     vision_manager: Optional[Any] = None  # Local vision processor (SmolVLM2)
+    # VoiceGate, so the sleep/wake tools can put the mic into standby as
+    # well as the body. Optional: tools work without it, minus standby.
+    voice_gate: Optional[Any] = None
 
 
 # Tool specifications in OpenAI format
@@ -272,6 +275,26 @@ TOOL_SPECS = [
     },
     {
         "type": "function",
+        "name": "sleep",
+        "description": "Go to sleep / standby. The robot lowers its head into the sleep pose and stops responding to anything except its wake word. Use when the user says 'go to sleep', 'take a nap', 'stop listening', 'be quiet for now', '\u53bb\u7761\u89ba', or similar. This does NOT shut the app down - use the shutdown tool for that.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "type": "function",
+        "name": "wake",
+        "description": "Wake up from sleep / standby: raise the head to the neutral pose and play the wake-up cue. Rarely needed as a tool call, since hearing the wake word already wakes the robot; use it if the user explicitly asks you to wake up or stretch.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "type": "function",
         "name": "shutdown",
         "description": "Stop the robot service and shut down the assistant app. Use this ONLY when the user explicitly asks you to shut down, power off, or stop the app (e.g., 'Clawbody, please shut down'). Do NOT use for casual goodbyes.",
         "parameters": {
@@ -283,13 +306,25 @@ TOOL_SPECS = [
 ]
 
 
+# Tools that only make sense when the voice gate can actually enforce a
+# standby state; hidden from the model otherwise so it can't offer to go
+# to sleep and then keep answering.
+_SLEEP_TOOL_NAMES = frozenset({"sleep", "wake"})
+
+
 def get_tool_specs() -> list[dict]:
     """Get the list of tool specifications for OpenAI.
     
     Returns:
         List of tool specification dictionaries
     """
-    return TOOL_SPECS
+    from reachy_mini_openclaw.config import config
+
+    if getattr(config, "ENABLE_SLEEP_TOOLS", True) and getattr(
+        config, "VOICE_GATE_ENABLED", True
+    ):
+        return TOOL_SPECS
+    return [s for s in TOOL_SPECS if s.get("name") not in _SLEEP_TOOL_NAMES]
 
 
 async def dispatch_tool_call(
@@ -323,6 +358,8 @@ async def dispatch_tool_call(
         "body_sway": _handle_body_sway,
         "stop_moves": _handle_stop_moves,
         "idle": _handle_idle,
+        "sleep": _handle_sleep,
+        "wake": _handle_wake,
         "shutdown": _handle_shutdown,
     }
     
@@ -698,6 +735,150 @@ async def _handle_body_sway(args: dict, deps: ToolDependencies) -> dict:
 
     _active_body_sway_task = asyncio.create_task(_runner())
     return {"status": "success", "amplitude_deg": amp_deg, "repeats": repeats}
+
+
+# --------------------------------------------------------------------------
+# Sleep / wake
+#
+# The Reachy Mini SDK does expose these natively: ReachyMini.wake_up() and
+# ReachyMini.goto_sleep() (reachy_mini/reachy_mini.py). Both are blocking --
+# goto_sleep runs a 2s goto plus a 2s settle and plays go_sleep.wav; wake_up
+# runs a 2s goto, plays wake_up.wav and does a small roll -- so both go to a
+# worker thread rather than stalling the audio event loop.
+#
+# They also drive the robot directly, which fights the MovementManager's
+# 100Hz set_target loop: left running, the loop would drag the head straight
+# back out of the sleep pose. So the manager is suspended for the duration
+# and resumed afterwards, which also re-seeds its smoother from the pose the
+# SDK actually left the robot in.
+# --------------------------------------------------------------------------
+
+
+def _sdk_sleep_api(deps: ToolDependencies) -> tuple[Optional[Any], Optional[Any]]:
+    """Resolve the SDK's sleep/wake callables on the robot handle.
+
+    Looked up by `getattr` rather than imported, so an older or newer SDK
+    without them degrades to a software-only standby instead of raising.
+
+    Args:
+        deps: Tool dependencies carrying the ReachyMini instance.
+
+    Returns:
+        (goto_sleep, wake_up); either may be None if unavailable.
+    """
+    robot = getattr(deps, "robot", None)
+    goto_sleep = getattr(robot, "goto_sleep", None)
+    wake_up = getattr(robot, "wake_up", None)
+    return (
+        goto_sleep if callable(goto_sleep) else None,
+        wake_up if callable(wake_up) else None,
+    )
+
+
+async def _run_suspended(deps: ToolDependencies, fn: Any) -> None:
+    """Run a blocking SDK motion with the movement loop out of the way.
+
+    Args:
+        deps: Tool dependencies.
+        fn: Zero-argument blocking callable (goto_sleep / wake_up).
+    """
+    mm = getattr(deps, "movement_manager", None)
+    can_suspend = mm is not None and hasattr(mm, "set_suspended")
+
+    if can_suspend:
+        mm.set_suspended(True)
+        # One control period plus margin, so the loop is guaranteed to have
+        # seen the command before the SDK starts writing
+        await asyncio.sleep(0.05)
+    elif mm is not None:
+        # Older manager: at least stop queued motion from fighting the goto
+        mm.clear_move_queue()
+
+    try:
+        await asyncio.to_thread(fn)
+    finally:
+        if can_suspend:
+            mm.set_suspended(False)
+
+
+async def sleep_robot_body(deps: ToolDependencies) -> dict:
+    """Put the robot into the SDK sleep pose. Safe to call without the SDK API.
+
+    Returns:
+        Result dict; ``"source"`` reports whether the physical motion ran.
+    """
+    await _cancel_active_body_sway()
+    goto_sleep, _ = _sdk_sleep_api(deps)
+    if goto_sleep is None:
+        logger.info("SDK has no goto_sleep(); standby is software-only")
+        return {
+            "status": "success",
+            "source": "software_only",
+            "message": "Going quiet. Say my name to wake me.",
+        }
+    try:
+        await _run_suspended(deps, goto_sleep)
+        return {
+            "status": "success",
+            "source": "sdk_goto_sleep",
+            "message": "Going to sleep. Say my name to wake me.",
+        }
+    except Exception as e:
+        logger.warning("goto_sleep failed: %s", e)
+        return {
+            "status": "success",
+            "source": "software_only",
+            "message": "Going quiet. Say my name to wake me.",
+            "warning": str(e),
+        }
+
+
+async def wake_robot_body(deps: ToolDependencies) -> dict:
+    """Bring the robot out of the sleep pose. Safe to call without the SDK API.
+
+    Returns:
+        Result dict; ``"source"`` reports whether the physical motion ran.
+    """
+    _, wake_up = _sdk_sleep_api(deps)
+    if wake_up is None:
+        logger.info("SDK has no wake_up(); nothing physical to do")
+        return {"status": "success", "source": "software_only"}
+    try:
+        await _run_suspended(deps, wake_up)
+        return {"status": "success", "source": "sdk_wake_up"}
+    except Exception as e:
+        logger.warning("wake_up failed: %s", e)
+        return {"status": "success", "source": "software_only", "warning": str(e)}
+
+
+async def _handle_sleep(args: dict, deps: ToolDependencies) -> dict:
+    """Handle the sleep tool: physical sleep pose plus voice standby.
+
+    The voice gate is put into standby *before* the motion runs, so the
+    go_sleep.wav cue and the servo noise it makes cannot themselves be
+    heard as a new turn and wake the robot straight back up.
+    """
+    gate = getattr(deps, "voice_gate", None)
+    if gate is not None and hasattr(gate, "enter_standby"):
+        gate.enter_standby()
+
+    result = await sleep_robot_body(deps)
+    result.setdefault(
+        "message", "Going to sleep. Say my name to wake me."
+    )
+    result["voice_standby"] = gate is not None
+    return result
+
+
+async def _handle_wake(args: dict, deps: ToolDependencies) -> dict:
+    """Handle the wake tool: leave standby and play the wake-up motion."""
+    gate = getattr(deps, "voice_gate", None)
+    if gate is not None and hasattr(gate, "leave_standby"):
+        gate.leave_standby()
+
+    result = await wake_robot_body(deps)
+    result.setdefault("message", "Awake and listening.")
+    return result
 
 
 async def _handle_shutdown(args: dict, deps: ToolDependencies) -> dict:
