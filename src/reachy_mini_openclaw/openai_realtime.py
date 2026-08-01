@@ -62,9 +62,28 @@ VAD_EAGERNESS = os.getenv("CLAWBODY_VAD_EAGERNESS", "low").strip().lower()
 VAD_THRESHOLD = float(os.getenv("CLAWBODY_VAD_THRESHOLD", "0.8") or 0.8)
 VAD_SILENCE_MS = int(float(os.getenv("CLAWBODY_VAD_SILENCE_MS", "700") or 700))
 
-# Always-on mic noise floor: frames below this RMS never reach the server,
-# so hum/servo whine can't become phantom turns. 0 disables.
-MIC_FLOOR_RMS = float(os.getenv("CLAWBODY_MIC_FLOOR_RMS", "0.02") or 0.0)
+# Always-on mic noise gate, so hum/servo whine can't become phantom turns.
+#
+# A single threshold does not work here. Speech averaged over a 63 ms frame
+# spends most of its time well below its own peaks -- inter-word gaps,
+# unvoiced consonants, syllable onsets -- so a flat floor set high enough to
+# reject chassis noise also rejects most of the voice. Measured on this
+# robot: a floor of 0.02 passed ~11% of frames while the user was plainly
+# talking (peaks 0.17-0.25), which is not enough audio for turn detection
+# to fire at all.
+#
+# So: open on a clear syllable, close only after the room has actually gone
+# quiet for a while. Frames the gate holds shut are sent as digital silence
+# rather than withheld -- see receive() for why that distinction matters
+# more than the thresholds do.
+#   OPEN     - a frame this loud opens the gate (above any observed noise)
+#   CLOSE    - only frames below this let the gate start closing
+#   HANGOVER - how long it stays open after the last frame above CLOSE
+MIC_GATE_OPEN_RMS = float(os.getenv("CLAWBODY_MIC_FLOOR_RMS", "0.025") or 0.0)
+MIC_GATE_CLOSE_RMS = float(
+    os.getenv("CLAWBODY_MIC_GATE_CLOSE_RMS", "0.008") or 0.0)
+MIC_GATE_HANGOVER_S = float(
+    os.getenv("CLAWBODY_MIC_GATE_HANGOVER_S", "0.4") or 0.0)
 
 # Log mic RMS statistics every N seconds (0 disables); used to diagnose
 # what the VAD is actually hearing on this chassis.
@@ -249,8 +268,9 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
 
         # Mic diagnostics: what the VAD actually hears on this chassis
         self._last_mic_rms = 0.0
-        self._mic_stats = [0.0, 0.0, 0, 0]  # [sum, max, frames, dropped]
+        self._mic_stats = [0.0, 0.0, 0, 0]  # [sum, max, frames, silenced]
         self._mic_stats_t = 0.0
+        self._mic_gate_until = 0.0  # noise gate stays open until this time
 
         # Strong refs to fire-and-forget tasks (event loop keeps only weak refs)
         self._bg_tasks: set = set()
@@ -951,6 +971,25 @@ OpenClaw has access to many capabilities you don't have directly.""",
         # 1.0s grace covers the device-side pipeline tail plus room reverb
         return now < self._audio_play_start + self._audio_enqueued_s + 1.0
 
+    def _mic_gate_shut(self, rms: float) -> bool:
+        """Is the always-on noise gate holding this frame shut?
+
+        Dual threshold with hold: a frame at OPEN admits the utterance, and
+        anything above CLOSE keeps it admitted, so the quiet parts *inside*
+        speech stay in. Only a genuinely quiet room -- every frame below
+        CLOSE for HANGOVER seconds -- lets it shut again. Chassis hum sits
+        below CLOSE and so can neither open nor hold it.
+        """
+        if MIC_GATE_OPEN_RMS <= 0.0:
+            return False
+        now = asyncio.get_event_loop().time()
+        if rms >= MIC_GATE_OPEN_RMS:
+            self._mic_gate_until = now + MIC_GATE_HANGOVER_S
+        elif rms >= MIC_GATE_CLOSE_RMS and now < self._mic_gate_until:
+            # Still inside an utterance; don't let the hold lapse mid-sentence
+            self._mic_gate_until = now + MIC_GATE_HANGOVER_S
+        return now >= self._mic_gate_until
+
     def _mic_stats_update(self, rms: float, dropped: bool) -> None:
         """Accumulate mic RMS stats and periodically log them."""
         if MIC_STATS_INTERVAL <= 0.0:
@@ -966,8 +1005,10 @@ OpenClaw has access to many capabilities you don't have directly.""",
             return
         if now - self._mic_stats_t >= MIC_STATS_INTERVAL and s[2] > 0:
             logger.info(
-                "Mic stats: avg RMS %.4f, max %.4f, %d frames, %d dropped (playing=%s base=%s)",
+                "Mic stats: avg RMS %.4f, max %.4f, %d frames, %d silenced "
+                "(%.0f%% voiced, playing=%s base=%s)",
                 s[0] / s[2], s[1], s[2], s[3],
+                100.0 * (s[2] - s[3]) / s[2],
                 self._robot_audio_playing(), self._base_in_motion(),
             )
             self._mic_stats = [0.0, 0.0, 0, 0]
@@ -1005,24 +1046,34 @@ OpenClaw has access to many capabilities you don't have directly.""",
 
         rms = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
         self._last_mic_rms = rms
-        dropped = False
 
-        # Always-on floor: hum and servo whine never reach the server VAD
-        if MIC_FLOOR_RMS > 0.0 and rms < MIC_FLOOR_RMS:
-            dropped = True
+        # Always-on noise gate with hysteresis and hangover
+        gated = self._mic_gate_shut(rms)
+
         # Echo/noise gate: while the robot's own speech is playing OR the
-        # base motor is slewing, drop quiet mic frames (speaker bleed and
+        # base motor is slewing, silence quiet mic frames (speaker bleed and
         # motor noise) so the server VAD doesn't spawn phantom user turns;
         # loud speech still passes so the user can interrupt or call out to
         # a searching robot. BARGE_IN_RMS=0 disables the gate.
-        elif BARGE_IN_RMS > 0.0 and (self._robot_audio_playing() or self._base_in_motion()):
-            if rms < BARGE_IN_RMS:
-                dropped = True
+        if not gated and BARGE_IN_RMS > 0.0 and (
+            self._robot_audio_playing() or self._base_in_motion()
+        ):
+            gated = rms < BARGE_IN_RMS
 
-        self._mic_stats_update(rms, dropped)
-        if dropped:
-            return
-                
+        self._mic_stats_update(rms, gated)
+        if gated:
+            # Substitute silence instead of withholding the frame. The
+            # Realtime API's turn detection reads one continuous stream, so
+            # a withheld frame does not read as a pause -- it removes that
+            # slice of time entirely and splices what surrounds it together.
+            # Gating a sentence's quiet parts by dropping them therefore
+            # hands the model the loud fragments butted end to end, with
+            # every pause and word boundary deleted. Zeros keep the
+            # timeline intact, which is what the noise was being kept out
+            # of the stream to protect in the first place.
+            audio = np.zeros_like(audio)
+
+
         # Resample to OpenAI sample rate
         if input_sr != OPENAI_SAMPLE_RATE:
             num_samples = int(len(audio) * OPENAI_SAMPLE_RATE / input_sr)
