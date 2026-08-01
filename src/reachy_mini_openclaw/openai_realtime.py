@@ -31,6 +31,11 @@ from websockets.exceptions import ConnectionClosedError
 
 from reachy_mini_openclaw.config import config
 from reachy_mini_openclaw.prompts import get_session_voice
+from reachy_mini_openclaw.voice_gate import (
+    GateDecision,
+    VoiceGate,
+    settings_from_config,
+)
 from reachy_mini_openclaw.tools.core_tools import ToolDependencies, get_tool_specs, dispatch_tool_call
 
 logger = logging.getLogger(__name__)
@@ -88,6 +93,34 @@ MIC_GATE_HANGOVER_S = float(
 # Log mic RMS statistics every N seconds (0 disables); used to diagnose
 # what the VAD is actually hearing on this chassis.
 MIC_STATS_INTERVAL = float(os.getenv("CLAWBODY_MIC_STATS_S", "5") or 0.0)
+
+# Spoken when input is unintelligible and CLAWBODY_APOLOGIZE_ON_REJECT is
+# on. Phrased as an instruction because it is passed as a per-response
+# instructions override, not as literal text -- the model still speaks it
+# in its own voice, but it has nothing else to work from and so cannot
+# invent a context the way it did with "Pogledaj." -> "Goodnight!".
+APOLOGY_INSTRUCTIONS = (
+    "You did not understand the user's last utterance. Say one short line "
+    "asking them to repeat, in the language you were last spoken to. "
+    "Do NOT guess what they said. Do NOT greet them. Do NOT mention the "
+    "time of day. Do NOT start a new topic. One sentence maximum."
+)
+
+# Phrases that wake a sleeping robot. While asleep the model is not
+# generating responses, so nothing else can act on what it hears -- this
+# local match is the only way back. The robot's name is included on its
+# own because transcription of a short wake phrase is unreliable (the
+# name has come back as "Ra" before), and the cost of a false wake is one
+# unnecessary greeting while the cost of a missed one is a robot that
+# cannot be woken by voice at all.
+WAKE_PHRASES = [
+    p.strip().lower()
+    for p in os.getenv(
+        "CLAWBODY_WAKE_PHRASES",
+        "kira,wake up,wakeup,wake,起來,起来,醒醒,醒來,醒来,起床",
+    ).split(",")
+    if p.strip()
+]
 
 # Sound-source orientation: when the user starts speaking, read Direction of
 # Arrival from the mic array and turn the head toward the voice.
@@ -169,6 +202,40 @@ If you're unsure whether you can handle something locally, default to
 ask_openclaw. Say "let me check" and call the tool. Never say "I can't
 do that" or "I don't have access" — your OpenClaw brain has access to
 almost everything.
+"""
+
+# Appended to the system instructions whenever the voice gate is active.
+# The gate is the hard filter; this is the soft one. Both are needed: the
+# gate can only judge the transcript it is given, and the model will still
+# improvise if a partially-garbled but in-language fragment gets through.
+ADDRESS_DISCIPLINE_INSTRUCTIONS = """
+
+## Listening discipline (IMPORTANT)
+
+Your microphone hears the entire room, not just the person talking to you.
+Other people -- including children, who may be speaking Japanese -- and
+background audio all reach you. Most of what you hear is not addressed to
+you.
+
+**Never invent context.** If an utterance is short, garbled, in a language
+the user does not speak, or simply does not make sense, you do NOT know
+what was said. Say one short line asking them to repeat, or say nothing.
+Never guess at what they might have meant and answer the guess. Never
+construct a scenario that would explain a fragment.
+
+**Do not re-greet.** Greet the user once at the start of a conversation.
+After that, never open a reply with "Hi", "Hey there", "What's on your
+mind?" or any equivalent, no matter how little content the user's turn
+carried.
+
+**Acknowledgments are not questions.** If the user says only "mm", "ok",
+"嗯", "啊" or similar, they are listening, not asking. Say nothing, or at
+most a single word. Do not restate your previous answer.
+
+**Only English and Mandarin are yours.** The user speaks English and
+Mandarin. If you believe you heard another language, you have
+mistranscribed something or overheard someone else. Do not answer it and
+do not switch languages.
 """
 
 # Fallback if OpenClaw context fetch fails
@@ -272,6 +339,23 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         self._mic_stats_t = 0.0
         self._mic_gate_until = 0.0  # noise gate stays open until this time
 
+        # Voice gate: decides which transcripts are actually meant for us.
+        # Shared with the tool layer so the sleep/wake tools can drive the
+        # same standby state the transcript path reads.
+        self._voice_gate = VoiceGate(settings_from_config(config))
+        self._gate_active = bool(getattr(config, "VOICE_GATE_ENABLED", True))
+        try:
+            self.deps.voice_gate = self._voice_gate
+        except Exception:
+            # Older ToolDependencies without the field; sleep/wake still
+            # move the body, they just can't gate the mic
+            logger.debug("ToolDependencies has no voice_gate field")
+        # Base instructions, kept so the per-turn time line can be re-appended
+        self._base_instructions = ""
+        self._time_grounded_at = 0.0
+        self._asleep = False
+        self._sleep_lock = asyncio.Lock()
+
         # Strong refs to fire-and-forget tasks (event loop keeps only weak refs)
         self._bg_tasks: set = set()
         
@@ -282,6 +366,155 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
     def copy(self) -> "OpenAIRealtimeHandler":
         """Create a copy of the handler (required by fastrtc)."""
         return OpenAIRealtimeHandler(self.deps, self.openclaw_bridge, self.gradio_mode)
+
+    # ------------------------------------------------------------------
+    # Voice gating helpers
+    # ------------------------------------------------------------------
+
+    def _time_line(self) -> str:
+        """Current local time as a line for the model's instructions.
+
+        Exists because the model, given a fragment it could not parse,
+        answered "Goodnight! Hope you sleep well" at 13:28 in the
+        afternoon. It has no clock of its own; without being told, any
+        time-of-day statement it makes is a guess.
+        """
+        tz_name = getattr(config, "TIME_ZONE", "America/Los_Angeles")
+        try:
+            from zoneinfo import ZoneInfo
+
+            now = datetime.now(ZoneInfo(tz_name))
+        except Exception:
+            now = datetime.now()
+        return (
+            "\n\n## Current time (authoritative)\n"
+            f"It is {now.strftime('%A, %B %d, %Y at %-I:%M %p')} "
+            f"({tz_name}).\n"
+            "This is the real local time. Never guess or infer the time of "
+            "day, and never greet the user with a time-based greeting "
+            "(good morning / goodnight) that contradicts it."
+        )
+
+    async def _refresh_time_grounding(self, force: bool = False) -> None:
+        """Re-send session instructions with a fresh timestamp.
+
+        Rate-limited to once a minute: the timestamp is only accurate to
+        the minute anyway, and a session.update per turn during a rapid
+        exchange is pure overhead.
+
+        Args:
+            force: Update even if the rate limit has not elapsed.
+        """
+        if not getattr(config, "TIME_GROUNDING_ENABLED", True):
+            return
+        if not self.connection or not self._base_instructions:
+            return
+        now = asyncio.get_event_loop().time()
+        if not force and now - self._time_grounded_at < 60.0:
+            return
+        self._time_grounded_at = now
+        try:
+            await self.connection.session.update(
+                session={
+                    "type": "realtime",
+                    "instructions": self._base_instructions + self._time_line(),
+                }
+            )
+        except Exception as e:
+            logger.debug("Time grounding update failed: %s", e)
+
+    async def _drop_conversation_item(self, item_id: Optional[str]) -> None:
+        """Remove a rejected input item from the server-side history.
+
+        A rejected turn is noise -- someone else's Japanese, a mis-heard
+        fragment, a cough. Leaving it in the conversation means the next
+        real question is answered with that noise still in context, which
+        is how a stray token turns into an invented topic.
+        """
+        if not item_id or not self.connection:
+            return
+        try:
+            await self.connection.conversation.item.delete(item_id=item_id)
+        except Exception as e:
+            logger.debug("Could not delete rejected item %s: %s", item_id, e)
+
+    async def _speak_apology(self) -> None:
+        """Ask for one short 'didn't catch that' line and nothing else."""
+        if not self.connection:
+            return
+        try:
+            await self.connection.response.create(
+                response={
+                    "instructions": APOLOGY_INSTRUCTIONS,
+                    "output_modalities": ["audio"],
+                }
+            )
+        except Exception as e:
+            logger.debug("Apology response failed: %s", e)
+
+    async def _on_gated_transcript(
+        self, transcript: str, item_id: Optional[str]
+    ) -> None:
+        """Run the voice gate on a completed transcript and act on it.
+
+        This is the single decision point for whether the robot answers.
+        It runs on transcription completion rather than on speech-stop
+        because the transcript is the only signal that carries language and
+        content; energy and semantic VAD both fire happily on a child
+        talking across the room.
+
+        Args:
+            transcript: The completed input transcription.
+            item_id: Server-side conversation item id, so a rejected turn
+                can be removed from history.
+        """
+        decision: GateDecision = self._voice_gate.evaluate(transcript)
+
+        if decision.allow:
+            logger.info(
+                "Voice gate: accepted (%s, lang=%s)", decision.reason, decision.language
+            )
+            self._last_user_message = transcript
+            await self.output_queue.put(
+                AdditionalOutputs({"role": "user", "content": transcript})
+            )
+            if decision.woke_from_standby:
+                await self._wake_body()
+            await self._refresh_time_grounding()
+            try:
+                await self.connection.response.create()
+            except Exception as e:
+                logger.debug("response.create after gate failed: %s", e)
+            return
+
+        logger.info(
+            "Voice gate: dropped %r (%s, lang=%s)",
+            transcript[:60], decision.reason, decision.language,
+        )
+        self.deps.movement_manager.set_processing(False)
+        await self._drop_conversation_item(item_id)
+        if decision.apology:
+            await self._speak_apology()
+
+    async def _wake_body(self) -> None:
+        """Play the SDK wake-up motion after a standby period.
+
+        Best-effort: `ReachyMini.wake_up()` is synchronous and sleeps
+        internally, so `wake_robot_body` runs it on a worker thread. Fired
+        as a background task rather than awaited, so the reply to the wake
+        word is not held up behind ~2.5s of motion.
+        """
+        from reachy_mini_openclaw.tools.core_tools import wake_robot_body
+
+        async def _run() -> None:
+            try:
+                await wake_robot_body(self.deps)
+            except Exception as e:
+                logger.debug("Wake-up motion failed: %s", e)
+
+        task = asyncio.create_task(_run())
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
     
     def _build_tools(self) -> list[dict]:
         """Build the tool list for the session."""
@@ -372,6 +605,14 @@ OpenClaw has access to many capabilities you don't have directly.""",
         
         # Fetch OpenClaw agent context (personality, memories, user info)
         system_instructions = await self._build_system_instructions()
+        self._base_instructions = system_instructions
+        if self._gate_active:
+            system_instructions += ADDRESS_DISCIPLINE_INSTRUCTIONS
+            self._base_instructions = system_instructions
+        system_instructions += self._time_line()
+
+        # The gate re-arms per session: a reconnect is a fresh room.
+        self._voice_gate.close_grace()
         
         # GA Realtime API (the beta API shape was retired by OpenAI in May 2026)
         async with self.client.realtime.connect(model=model) as conn:
@@ -391,11 +632,18 @@ OpenClaw has access to many capabilities you don't have directly.""",
                             },
                             # Robot mic sits away from the speaker's mouth
                             "noise_reduction": {"type": "far_field"},
+                            # With the voice gate on, the server must NOT
+                            # answer on its own: whether an utterance was
+                            # meant for us is only knowable from the
+                            # transcript, which arrives after turn end. So
+                            # detection still segments turns and still
+                            # interrupts playback for barge-in, but response
+                            # creation moves to _on_gated_transcript.
                             "turn_detection": (
                                 {
                                     "type": "semantic_vad",
                                     "eagerness": VAD_EAGERNESS,
-                                    "create_response": True,
+                                    "create_response": not self._gate_active,
                                     "interrupt_response": True,
                                 }
                                 if VAD_MODE == "semantic"
@@ -404,7 +652,7 @@ OpenClaw has access to many capabilities you don't have directly.""",
                                     "threshold": VAD_THRESHOLD,
                                     "prefix_padding_ms": 300,
                                     "silence_duration_ms": VAD_SILENCE_MS,
-                                    "create_response": True,
+                                    "create_response": not self._gate_active,
                                     "interrupt_response": True,
                                 }
                             ),
@@ -457,6 +705,12 @@ OpenClaw has access to many capabilities you don't have directly.""",
         event_type = event.type
         
         # Speech detection
+        if event_type == "input_audio_buffer.speech_started" and self._asleep:
+            # Asleep: stay still and stay quiet. The transcript is still
+            # coming, and that is what listens for the wake phrase.
+            logger.debug("Speech heard while asleep; waiting for a wake phrase")
+            return
+
         if event_type == "input_audio_buffer.speech_started":
             # User started speaking - the new turn takes priority
             self._turn_counter += 1
@@ -509,12 +763,28 @@ OpenClaw has access to many capabilities you don't have directly.""",
         # Transcription (for logging, UI, and sync)
         if event_type == "conversation.item.input_audio_transcription.completed":
             transcript = event.transcript
-            if transcript and transcript.strip():
+            if self._gate_active:
+                # Gate owns response creation; see _on_gated_transcript
+                logger.info("User (raw): %s", transcript)
+                await self._on_gated_transcript(
+                    transcript or "", getattr(event, "item_id", None)
+                )
+            elif transcript and transcript.strip():
                 logger.info("User: %s", transcript)
                 self._last_user_message = transcript  # Track for sync
                 await self.output_queue.put(
                     AdditionalOutputs({"role": "user", "content": transcript})
                 )
+
+        # Transcription failed outright: no text, so nothing safe to answer.
+        if event_type == "conversation.item.input_audio_transcription.failed":
+            if self._gate_active:
+                logger.info("Voice gate: dropped turn (transcription failed)")
+                self.deps.movement_manager.set_processing(False)
+                await self._drop_conversation_item(getattr(event, "item_id", None))
+                # While asleep the model isn't answering, so this local
+                # match is the only thing that can bring the robot back
+                await self._maybe_wake(transcript)
             
         # Response started - robot is about to speak
         if event_type == "response.created":
@@ -745,6 +1015,131 @@ OpenClaw has access to many capabilities you don't have directly.""",
                 "error": f"OpenClaw query failed: {e}. "
                 "Tell the user there was a technical issue reaching your backend."
             }
+
+    def is_asleep(self) -> bool:
+        """True while the robot is in its sleep pose and not answering."""
+        return self._asleep
+
+    async def _set_auto_response(self, enabled: bool) -> None:
+        """Turn server-side response generation on or off.
+
+        Transcription keeps running either way, which is what makes a
+        sleeping robot still able to hear its wake phrase.
+        """
+        if not self.connection:
+            return
+        turn_detection = (
+            {
+                "type": "semantic_vad",
+                "eagerness": VAD_EAGERNESS,
+                "create_response": enabled,
+                "interrupt_response": enabled,
+            }
+            if VAD_MODE == "semantic"
+            else {
+                "type": "server_vad",
+                "threshold": VAD_THRESHOLD,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": VAD_SILENCE_MS,
+                "create_response": enabled,
+                "interrupt_response": enabled,
+            }
+        )
+        await self.connection.session.update(
+            session={
+                "type": "realtime",
+                "audio": {"input": {"turn_detection": turn_detection}},
+            },
+        )
+
+    async def go_to_sleep(self) -> bool:
+        """Settle into the sleep pose and stop answering until woken.
+
+        Waits for any in-flight speech so the goodbye is actually heard,
+        then hands the robot to the SDK's blocking goto_sleep with the
+        movement loop suspended -- otherwise the 100Hz loop would drag it
+        straight back upright.
+        """
+        async with self._sleep_lock:
+            if self._asleep:
+                return False
+            robot = getattr(self.deps, "robot", None)
+            if robot is None or not hasattr(robot, "goto_sleep"):
+                logger.warning("goto_sleep not available on this robot")
+                return False
+
+            # Let the spoken goodbye finish before the motors move
+            for _ in range(60):  # ~6s ceiling
+                if not self._robot_audio_playing():
+                    break
+                await asyncio.sleep(0.1)
+
+            self._asleep = True
+            try:
+                await self._set_auto_response(False)
+            except Exception as e:
+                logger.warning("Could not pause responses for sleep: %s", e)
+
+            mm = self.deps.movement_manager
+            if self.deps.camera_worker is not None:
+                self.deps.camera_worker.set_head_tracking_enabled(False)
+            if self.deps.head_wobbler is not None:
+                self.deps.head_wobbler.reset()
+            mm.clear_move_queue()
+            mm.set_suspended(True)
+            await asyncio.sleep(0.15)  # let the loop see the suspend
+
+            try:
+                await asyncio.to_thread(robot.goto_sleep)
+                logger.info("Robot asleep; say a wake phrase to bring it back")
+            except Exception as e:
+                logger.error("goto_sleep failed: %s", e)
+            return True
+
+    async def wake_up(self) -> bool:
+        """Come back from sleep and resume normal conversation."""
+        async with self._sleep_lock:
+            if not self._asleep:
+                return False
+            robot = getattr(self.deps, "robot", None)
+            mm = self.deps.movement_manager
+
+            try:
+                if robot is not None and hasattr(robot, "wake_up"):
+                    await asyncio.to_thread(robot.wake_up)
+            except Exception as e:
+                logger.error("wake_up failed: %s", e)
+
+            # Resume only once the robot has stopped moving itself; the
+            # loop re-seeds from the real pose as it picks control back up
+            mm.set_suspended(False)
+            if self.deps.camera_worker is not None:
+                self.deps.camera_worker.set_head_tracking_enabled(True)
+            self._asleep = False
+
+            try:
+                await self._set_auto_response(True)
+            except Exception as e:
+                logger.warning("Could not resume responses after wake: %s", e)
+            logger.info("Robot awake")
+            return True
+
+    async def _maybe_wake(self, transcript: str) -> bool:
+        """Wake the robot if a sleeping ear heard its wake phrase."""
+        if not self._asleep or not WAKE_PHRASES:
+            return False
+        if _find_cue(transcript, WAKE_PHRASES) is None:
+            return False
+        logger.info("Wake phrase heard: %r", transcript.strip())
+        if not await self.wake_up():
+            return False
+        # Greet, so waking is audibly confirmed
+        try:
+            if self.connection:
+                await self.connection.response.create()
+        except Exception as e:
+            logger.debug("Wake greeting failed: %s", e)
+        return True
 
     async def _trigger_turn_gesture(self, user_text: Optional[str]) -> None:
         """Trigger a small, natural gesture at the start of a response.
