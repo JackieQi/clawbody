@@ -106,22 +106,6 @@ APOLOGY_INSTRUCTIONS = (
     "time of day. Do NOT start a new topic. One sentence maximum."
 )
 
-# Phrases that wake a sleeping robot. While asleep the model is not
-# generating responses, so nothing else can act on what it hears -- this
-# local match is the only way back. The robot's name is included on its
-# own because transcription of a short wake phrase is unreliable (the
-# name has come back as "Ra" before), and the cost of a false wake is one
-# unnecessary greeting while the cost of a missed one is a robot that
-# cannot be woken by voice at all.
-WAKE_PHRASES = [
-    p.strip().lower()
-    for p in os.getenv(
-        "CLAWBODY_WAKE_PHRASES",
-        "kira,wake up,wakeup,wake,起來,起来,醒醒,醒來,醒来,起床",
-    ).split(",")
-    if p.strip()
-]
-
 # Sound-source orientation: when the user starts speaking, read Direction of
 # Arrival from the mic array and turn the head toward the voice.
 # The ReSpeaker reports 0=left, pi/2=front, pi=right across a 180° arc.
@@ -353,8 +337,6 @@ class OpenAIRealtimeHandler(AsyncStreamHandler):
         # Base instructions, kept so the per-turn time line can be re-appended
         self._base_instructions = ""
         self._time_grounded_at = 0.0
-        self._asleep = False
-        self._sleep_lock = asyncio.Lock()
 
         # Strong refs to fire-and-forget tasks (event loop keeps only weak refs)
         self._bg_tasks: set = set()
@@ -705,12 +687,6 @@ OpenClaw has access to many capabilities you don't have directly.""",
         event_type = event.type
         
         # Speech detection
-        if event_type == "input_audio_buffer.speech_started" and self._asleep:
-            # Asleep: stay still and stay quiet. The transcript is still
-            # coming, and that is what listens for the wake phrase.
-            logger.debug("Speech heard while asleep; waiting for a wake phrase")
-            return
-
         if event_type == "input_audio_buffer.speech_started":
             # User started speaking - the new turn takes priority
             self._turn_counter += 1
@@ -782,9 +758,6 @@ OpenClaw has access to many capabilities you don't have directly.""",
                 logger.info("Voice gate: dropped turn (transcription failed)")
                 self.deps.movement_manager.set_processing(False)
                 await self._drop_conversation_item(getattr(event, "item_id", None))
-                # While asleep the model isn't answering, so this local
-                # match is the only thing that can bring the robot back
-                await self._maybe_wake(transcript)
             
         # Response started - robot is about to speak
         if event_type == "response.created":
@@ -1015,131 +988,6 @@ OpenClaw has access to many capabilities you don't have directly.""",
                 "error": f"OpenClaw query failed: {e}. "
                 "Tell the user there was a technical issue reaching your backend."
             }
-
-    def is_asleep(self) -> bool:
-        """True while the robot is in its sleep pose and not answering."""
-        return self._asleep
-
-    async def _set_auto_response(self, enabled: bool) -> None:
-        """Turn server-side response generation on or off.
-
-        Transcription keeps running either way, which is what makes a
-        sleeping robot still able to hear its wake phrase.
-        """
-        if not self.connection:
-            return
-        turn_detection = (
-            {
-                "type": "semantic_vad",
-                "eagerness": VAD_EAGERNESS,
-                "create_response": enabled,
-                "interrupt_response": enabled,
-            }
-            if VAD_MODE == "semantic"
-            else {
-                "type": "server_vad",
-                "threshold": VAD_THRESHOLD,
-                "prefix_padding_ms": 300,
-                "silence_duration_ms": VAD_SILENCE_MS,
-                "create_response": enabled,
-                "interrupt_response": enabled,
-            }
-        )
-        await self.connection.session.update(
-            session={
-                "type": "realtime",
-                "audio": {"input": {"turn_detection": turn_detection}},
-            },
-        )
-
-    async def go_to_sleep(self) -> bool:
-        """Settle into the sleep pose and stop answering until woken.
-
-        Waits for any in-flight speech so the goodbye is actually heard,
-        then hands the robot to the SDK's blocking goto_sleep with the
-        movement loop suspended -- otherwise the 100Hz loop would drag it
-        straight back upright.
-        """
-        async with self._sleep_lock:
-            if self._asleep:
-                return False
-            robot = getattr(self.deps, "robot", None)
-            if robot is None or not hasattr(robot, "goto_sleep"):
-                logger.warning("goto_sleep not available on this robot")
-                return False
-
-            # Let the spoken goodbye finish before the motors move
-            for _ in range(60):  # ~6s ceiling
-                if not self._robot_audio_playing():
-                    break
-                await asyncio.sleep(0.1)
-
-            self._asleep = True
-            try:
-                await self._set_auto_response(False)
-            except Exception as e:
-                logger.warning("Could not pause responses for sleep: %s", e)
-
-            mm = self.deps.movement_manager
-            if self.deps.camera_worker is not None:
-                self.deps.camera_worker.set_head_tracking_enabled(False)
-            if self.deps.head_wobbler is not None:
-                self.deps.head_wobbler.reset()
-            mm.clear_move_queue()
-            mm.set_suspended(True)
-            await asyncio.sleep(0.15)  # let the loop see the suspend
-
-            try:
-                await asyncio.to_thread(robot.goto_sleep)
-                logger.info("Robot asleep; say a wake phrase to bring it back")
-            except Exception as e:
-                logger.error("goto_sleep failed: %s", e)
-            return True
-
-    async def wake_up(self) -> bool:
-        """Come back from sleep and resume normal conversation."""
-        async with self._sleep_lock:
-            if not self._asleep:
-                return False
-            robot = getattr(self.deps, "robot", None)
-            mm = self.deps.movement_manager
-
-            try:
-                if robot is not None and hasattr(robot, "wake_up"):
-                    await asyncio.to_thread(robot.wake_up)
-            except Exception as e:
-                logger.error("wake_up failed: %s", e)
-
-            # Resume only once the robot has stopped moving itself; the
-            # loop re-seeds from the real pose as it picks control back up
-            mm.set_suspended(False)
-            if self.deps.camera_worker is not None:
-                self.deps.camera_worker.set_head_tracking_enabled(True)
-            self._asleep = False
-
-            try:
-                await self._set_auto_response(True)
-            except Exception as e:
-                logger.warning("Could not resume responses after wake: %s", e)
-            logger.info("Robot awake")
-            return True
-
-    async def _maybe_wake(self, transcript: str) -> bool:
-        """Wake the robot if a sleeping ear heard its wake phrase."""
-        if not self._asleep or not WAKE_PHRASES:
-            return False
-        if _find_cue(transcript, WAKE_PHRASES) is None:
-            return False
-        logger.info("Wake phrase heard: %r", transcript.strip())
-        if not await self.wake_up():
-            return False
-        # Greet, so waking is audibly confirmed
-        try:
-            if self.connection:
-                await self.connection.response.create()
-        except Exception as e:
-            logger.debug("Wake greeting failed: %s", e)
-        return True
 
     async def _trigger_turn_gesture(self, user_text: Optional[str]) -> None:
         """Trigger a small, natural gesture at the start of a response.
