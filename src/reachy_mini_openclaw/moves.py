@@ -665,6 +665,9 @@ class MovementManager:
         )
         self._last_resync_poll = float("-inf")
         self._diverged_since: Optional[float] = None
+        # While suspended the loop composes nothing and sends nothing, so
+        # another controller (goto_sleep/wake_up) owns the robot outright
+        self._suspended = False
 
         # Body-follow face tracking state
         self._body_follow_active = False
@@ -679,6 +682,7 @@ class MovementManager:
         self._shared_is_listening = False
         self._shared_body_yaw = (0.0, 0.0)  # (current, target)
         self._shared_primary_pose = clone_pose(self.state.last_primary_pose)
+        self._shared_suspended = False
         self._base_active_until = float("-inf")
         self._shared_base_active_until = float("-inf")
         
@@ -720,6 +724,23 @@ class MovementManager:
     def halt_body_yaw(self) -> None:
         """Stop any body rotation in progress at its current angle. Thread-safe."""
         self._command_queue.put(("halt_body_yaw", None))
+
+    def set_suspended(self, suspended: bool) -> None:
+        """Stop or resume issuing set_target. Thread-safe.
+
+        Hand the robot over to something else -- goto_sleep, wake_up, any
+        blocking goto_target -- by suspending first, otherwise this loop
+        keeps writing at 100Hz and drags the robot straight back out of
+        whatever pose that call put it in. On resume the smoother is
+        re-seeded from the robot's real pose, so control returns without a
+        step no matter where it was left.
+        """
+        self._command_queue.put(("set_suspended", bool(suspended)))
+
+    def is_suspended(self) -> bool:
+        """True while output to the robot is suspended. Thread-safe."""
+        with self._shared_lock:
+            return self._shared_suspended
 
     def get_body_yaw(self) -> Tuple[float, float]:
         """Get (current, target) base body yaw in radians. Thread-safe."""
@@ -965,6 +986,23 @@ class MovementManager:
             self._body_yaw_target = self._body_yaw_current
             self._body_yaw_vel_cmd = None
             self._external_yaw_cmd_time = current_time
+        elif cmd == "set_suspended":
+            desired = bool(payload)
+            if self._suspended != desired:
+                self._suspended = desired
+                if desired:
+                    # Drop queued motion: it belongs to the old context and
+                    # would fire the moment control came back
+                    self.move_queue.clear()
+                    self.state.current_move = None
+                    self.state.move_start_time = None
+                    self._breathing_active = False
+                    self._body_yaw_vel_cmd = None
+                    logger.info("Movement output suspended")
+                else:
+                    self._reseed_from_measured()
+                    self.state.update_activity()
+                    logger.info("Movement output resumed")
                 
     def _manage_move_queue(self, current_time: float) -> None:
         """Advance the move queue."""
@@ -1200,20 +1238,10 @@ class MovementManager:
             self._diverged_since = None
             return
 
-        try:
-            joints, _ = self.current_robot.get_current_joint_positions()
-            measured = np.asarray(
-                self.current_robot.get_current_head_pose(), dtype=float
-            )
-        except Exception as e:
-            logger.debug("Pose resync read failed: %s", e)
+        measured = self._read_relative_pose()
+        if measured is None:
             return
-
-        # The measured pose is world-frame (FK over all seven joints);
-        # undo the base yaw to compare it with our body-relative command
-        base_yaw = float(joints[0])
-        relative = self._rotate_head_by_base_yaw(measured, -base_yaw)
-        measured_euler = R.from_matrix(relative[:3, :3]).as_euler("xyz")
+        base_yaw, measured_euler, translation = measured
         drift = float(np.max(np.abs(
             _wrap_angles(measured_euler - self._head_rot_limiter.pos)
         )))
@@ -1232,11 +1260,52 @@ class MovementManager:
             "Head %.0f° from commanded pose (external move?); easing back in",
             float(np.rad2deg(drift)),
         )
-        self._head_rot_limiter.reset(measured_euler)
-        self._head_pos_limiter.reset(relative[:3, 3])
+        self._seed_state(base_yaw, measured_euler, translation)
+
+    def _read_relative_pose(self) -> Optional[Tuple[float, NDArray, NDArray]]:
+        """Read the robot's real pose as (base yaw, body-relative euler, xyz).
+
+        The measured head pose is world-frame (FK over all seven joints),
+        so the base yaw is undone to make it comparable with the
+        body-relative pose this loop composes.
+        """
+        try:
+            joints, _ = self.current_robot.get_current_joint_positions()
+            measured = np.asarray(
+                self.current_robot.get_current_head_pose(), dtype=float
+            )
+        except Exception as e:
+            logger.debug("Pose read failed: %s", e)
+            return None
+        base_yaw = float(joints[0])
+        relative = self._rotate_head_by_base_yaw(measured, -base_yaw)
+        euler = R.from_matrix(relative[:3, :3]).as_euler("xyz")
+        return base_yaw, euler, np.asarray(relative[:3, 3], dtype=float)
+
+    def _seed_state(
+        self, base_yaw: float, euler: NDArray, translation: NDArray
+    ) -> None:
+        """Point the smoother and base tracking at a known real pose."""
+        self._head_rot_limiter.reset(euler)
+        self._head_pos_limiter.reset(translation)
         self._body_yaw_current = base_yaw
         self._body_yaw_target = base_yaw
         self._body_yaw_vel = 0.0
+        self._body_yaw_vel_cmd = None
+
+    def _reseed_from_measured(self) -> bool:
+        """Re-seed from wherever the robot actually is right now.
+
+        Used when control returns from something that drove the robot
+        directly (goto_sleep / wake_up / a daemon-played move), so the
+        first tick back eases out of the real pose instead of stepping
+        from the one this loop was holding before it let go.
+        """
+        measured = self._read_relative_pose()
+        if measured is None:
+            return False
+        self._seed_state(*measured)
+        return True
 
     def _rotate_head_by_base_yaw(self, head: NDArray, base_yaw: float) -> NDArray:
         """Express the body-relative head pose in the daemon's world frame."""
@@ -1268,6 +1337,7 @@ class MovementManager:
             self._shared_is_listening = self._is_listening
             self._shared_body_yaw = (self._body_yaw_current, self._body_yaw_target)
             self._shared_base_active_until = self._base_active_until
+            self._shared_suspended = self._suspended
             if self.state.last_primary_pose is not None:
                 self._shared_primary_pose = clone_pose(self.state.last_primary_pose)
             
@@ -1319,7 +1389,14 @@ class MovementManager:
             
             # Process signals
             self._poll_signals(loop_start)
-            
+
+            if self._suspended:
+                # Someone else owns the robot; compose nothing, send nothing
+                self._publish_shared_state()
+                elapsed = self._now() - loop_start
+                time.sleep(max(0.0, self.target_period - elapsed))
+                continue
+
             # Manage moves
             self._manage_move_queue(loop_start)
             self._manage_breathing(loop_start)
